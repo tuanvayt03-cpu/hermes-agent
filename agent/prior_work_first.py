@@ -208,11 +208,11 @@ def discover_prior_work(
     packet_path = capability_root / PACKET_FILENAME
     artifacts = {
         "preflight_packets": [_relpath(packet_path, repo_root)] if packet_path.is_file() else [],
-        "handoffs": _limited_file_listing(capability_root / "handoffs", limit=limit),
-        "receipts": _limited_file_listing(capability_root / "receipts", limit=limit),
-        "draft_builds": _limited_file_listing(capability_root / "drafts", limit=limit),
-        "rag": _limited_file_listing(capability_root / "rag", limit=limit),
-        "ledgers": _limited_file_listing(capability_root / "ledgers", limit=limit),
+        "handoffs": _limited_file_listing(capability_root / "handoffs", repo_root=repo_root, limit=limit),
+        "receipts": _limited_file_listing(capability_root / "receipts", repo_root=repo_root, limit=limit),
+        "draft_builds": _limited_file_listing(capability_root / "drafts", repo_root=repo_root, limit=limit),
+        "rag": _limited_file_listing(capability_root / "rag", repo_root=repo_root, limit=limit),
+        "ledgers": _limited_file_listing(capability_root / "ledgers", repo_root=repo_root, limit=limit),
     }
     fallback_hits: list[str] = []
     if state_root.exists():
@@ -824,7 +824,11 @@ def _record_maps(state: Mapping[str, Any]) -> dict[str, dict[str, Mapping[str, A
 
 
 def _limited_file_listing(
-    directory: Path, *, suffixes: set[str] | None = None, limit: int = 64
+    directory: Path,
+    *,
+    repo_root: Path | None = None,
+    suffixes: set[str] | None = None,
+    limit: int = 64,
 ) -> list[str]:
     if not directory.exists():
         return []
@@ -836,7 +840,7 @@ def _limited_file_listing(
             continue
         if suffixes and path.suffix.lower() not in suffixes:
             continue
-        found.append(str(path))
+        found.append(_relpath(path, repo_root) if repo_root is not None else str(path))
     return found
 
 

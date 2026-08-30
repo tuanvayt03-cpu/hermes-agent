@@ -208,6 +208,7 @@ def test_relevant_symbol_change_refreshes_only_affected_slice(tmp_path):
 
 def test_discovery_finds_handoff_worktree_draft_and_receipt_before_new_plan(tmp_path):
     repo = _init_repo(tmp_path)
+    packet = _packet(repo)
     cap_dir = pwf.canonical_capability_dir(repo, "demo-capability")
     (cap_dir / "handoffs").mkdir(parents=True)
     (cap_dir / "receipts").mkdir()
@@ -217,6 +218,7 @@ def test_discovery_finds_handoff_worktree_draft_and_receipt_before_new_plan(tmp_
     (cap_dir / "receipts" / "accepted.json").write_text("{}", encoding="utf-8")
     (cap_dir / "drafts" / "draft.txt").write_text("draft\n", encoding="utf-8")
     (cap_dir / "rag" / "impact.json").write_text("{}", encoding="utf-8")
+    (cap_dir / pwf.PACKET_FILENAME).write_text(json.dumps(packet, indent=2), encoding="utf-8")
     worktree_path = repo / ".worktrees" / "resume-demo"
     worktree_path.parent.mkdir()
     _git(repo, "worktree", "add", str(worktree_path), "-b", "feat/resume-demo", "HEAD")
@@ -225,10 +227,21 @@ def test_discovery_finds_handoff_worktree_draft_and_receipt_before_new_plan(tmp_
 
     assert discovery["SEARCH_MODE"] == "targeted_read_only"
     assert discovery["FULL_HISTORY_LOADED"] is False
-    assert discovery["ARTIFACTS"]["handoffs"]
-    assert discovery["ARTIFACTS"]["receipts"]
-    assert discovery["ARTIFACTS"]["draft_builds"]
-    assert discovery["ARTIFACTS"]["rag"]
+    assert discovery["ARTIFACTS"]["preflight_packets"] == [
+        ".task-state/prior-work-first/demo-capability/active.packet.json"
+    ]
+    assert discovery["ARTIFACTS"]["handoffs"] == [
+        ".task-state/prior-work-first/demo-capability/handoffs/accepted.md"
+    ]
+    assert discovery["ARTIFACTS"]["receipts"] == [
+        ".task-state/prior-work-first/demo-capability/receipts/accepted.json"
+    ]
+    assert discovery["ARTIFACTS"]["draft_builds"] == [
+        ".task-state/prior-work-first/demo-capability/drafts/draft.txt"
+    ]
+    assert discovery["ARTIFACTS"]["rag"] == [
+        ".task-state/prior-work-first/demo-capability/rag/impact.json"
+    ]
     assert any(item["branch"] == "feat/resume-demo" for item in discovery["KNOWN_WORKTREES"])
     assert any(item["branch"] == "feat/resume-demo" for item in discovery["KNOWN_BRANCHES"])
 
