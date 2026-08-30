@@ -3,8 +3,8 @@
   "GOAL": "Extend Hermes with durable prior-work-first execution memory across SOUL, repository rules, protocol, guard, and focused verification without broad rediscovery.",
   "CAPABILITY_ID": "HERMES-PRIOR-WORK-FIRST-EXECUTION-MEMORY-V1",
   "PREFLIGHT_STATUS": "verified",
-  "ACCEPTED_HEAD": "7974025bbe700a1161dbada167c3c47612113ae2",
-  "ACCEPTED_TREE": "77e60859bc50296b86dc4365cf225aae6207f763",
+  "ACCEPTED_HEAD": "3a336b8ab1757f75cb796f73d35b5200c45353c5",
+  "ACCEPTED_TREE": "54ff3dbefda912a65226541c38ee7d5c2d50d89e",
   "FIRST_UNPROVEN_BOUNDARY": "LIVE_ACTIVATION",
   "KNOWN_FILES": [
     {
@@ -72,20 +72,20 @@
   "KNOWN_RECEIPTS": [
     {
       "path": ".task-state/prior-work-first/hermes-prior-work-first-execution-memory-v1/receipts/2026-08-30-focused-tests.json",
-      "digest": "fba7f68fb0d62da3179501e49c5979c5b1737e359b87c8b7aff738af309d863f"
+      "digest": "e77e7915524d549098d6c900d8bb9f1bb779c4b330dda96243f9e36228000016"
     }
   ],
   "KNOWN_WORKTREES": [
     {
       "path": "C:/Users/Vu Tuan/AppData/Local/hermes/worktrees/prior-work-first-execution-memory-v1",
       "branch": "feat/prior-work-first-execution-memory-v1",
-      "head": "7974025bbe700a1161dbada167c3c47612113ae2"
+      "head": "3a336b8ab1757f75cb796f73d35b5200c45353c5"
     }
   ],
   "KNOWN_BRANCHES": [
     {
       "branch": "feat/prior-work-first-execution-memory-v1",
-      "head": "7974025bbe700a1161dbada167c3c47612113ae2",
+      "head": "3a336b8ab1757f75cb796f73d35b5200c45353c5",
       "upstream": "fork/feat/prior-work-first-execution-memory-v1"
     }
   ],
@@ -187,7 +187,7 @@
       "subject": "tests/agent/test_prior_work_first.py"
     }
   ],
-  "LAST_MACHINE_VERIFIED_AT": "2026-08-30T11:21:15.9918202+07:00",
+  "LAST_MACHINE_VERIFIED_AT": "2026-08-30T11:44:39.9882021+07:00",
   "PRIMARY_WRITER": "codex-primary-writer",
   "PARALLEL_SCOUTS": []
 }
