@@ -568,6 +568,300 @@ class TestProviderErrorPersistence(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         # But they have the same event_id for watchdog deduplication
 
+
+
+class TestV3DurableWorkflow(unittest.TestCase):
+    """V3 focused tests for durable workflow reconciliation."""
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test_watchdog.db")
+        self.store = WatchdogStore(self.db_path)
+    
+    def _insert_task(self, task_id: str, program_id: str = "test_program", **kwargs) -> None:
+        """Helper to insert a task record (required for FK)."""
+        from persistence.sqlite_store import TaskRecord
+        task = TaskRecord(
+            task_id=task_id,
+            session_id=kwargs.get("session_id", task_id.replace(":", "_")),
+            session_key=kwargs.get("session_key", ""),
+            source=kwargs.get("source", "test"),
+            platform=kwargs.get("platform", "local"),
+            cwd=kwargs.get("cwd", "/test"),
+            git_repo_root=kwargs.get("git_repo_root", "/test"),
+            first_seen_at=kwargs.get("first_seen_at", time.time()),
+            last_seen_at=kwargs.get("last_seen_at", time.time()),
+            last_activity_at=kwargs.get("last_activity_at", time.time()),
+            last_activity_description=kwargs.get("last_activity_description", "test"),
+            structured_state=kwargs.get("structured_state", "RUNNING"),
+            is_active=kwargs.get("is_active", 1),
+            metadata_json=kwargs.get("metadata_json", "{}")
+        )
+        self.store.upsert_task(task)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_task_state_machine_upsert_and_get(self):
+        """Test upserting and retrieving the canonical task state machine."""
+        task_id = "test_task_v3"
+        self._insert_task(task_id)
+        state = {
+            "task_id": task_id,
+            "program_id": "test_program",
+            "generation": 1,
+            "goal": "Complete feature X",
+            "capability": "codex",
+            "first_unproven_boundary": "boundary_1",
+            "accepted_baseline": "commit_abc123",
+            "completed_boundaries_json": json.dumps(["boundary_0"]),
+            "active_writer_identity": "codex_pid_1234",
+            "active_transaction_id": "txn_001",
+            "pending_action": "write_file",
+            "last_completed_action": "read_file",
+            "side_effect_state": "NONE",
+            "state_version": 1,
+            "checkpoint_hash": "chk_abc123",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        
+        self.store.upsert_task_state_machine(state)
+        retrieved = self.store.get_task_state_machine(task_id)
+        
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved["task_id"], task_id)
+        self.assertEqual(retrieved["program_id"], "test_program")
+        self.assertEqual(retrieved["generation"], 1)
+        self.assertEqual(retrieved["goal"], "Complete feature X")
+        self.assertEqual(retrieved["capability"], "codex")
+        self.assertEqual(retrieved["first_unproven_boundary"], "boundary_1")
+        self.assertEqual(retrieved["side_effect_state"], "NONE")
+        self.assertEqual(retrieved["state_version"], 1)
+
+    def test_task_state_machine_version_increment(self):
+        """Test optimistic state version increment."""
+        task_id = "test_task_version"
+        self._insert_task(task_id)
+        state = {
+            "task_id": task_id,
+            "program_id": "test_program",
+            "generation": 1,
+            "goal": "Test",
+            "capability": "codex",
+            "state_version": 1,
+        }
+        self.store.upsert_task_state_machine(state)
+        
+        # First increment should succeed
+        success1 = self.store.increment_state_version(task_id, 1)
+        self.assertTrue(success1)
+        
+        # Second increment with same expected version should fail
+        success2 = self.store.increment_state_version(task_id, 1)
+        self.assertFalse(success2)
+        
+        # Third increment with new expected version should succeed
+        success3 = self.store.increment_state_version(task_id, 2)
+        self.assertTrue(success3)
+        
+        # Verify final version
+        retrieved = self.store.get_task_state_machine(task_id)
+        self.assertEqual(retrieved["state_version"], 3)
+
+    def test_task_state_machine_by_program(self):
+        """Test querying state machines by program."""
+        for i in range(3):
+            task_id = f"task_{i}"
+            self._insert_task(task_id)
+            state = {
+                "task_id": task_id,
+                "program_id": "program_A" if i < 2 else "program_B",
+                "generation": 1,
+                "goal": f"Goal {i}",
+                "capability": "codex",
+            }
+            self.store.upsert_task_state_machine(state)
+        
+        program_a = self.store.get_task_state_machines_by_program("program_A")
+        program_b = self.store.get_task_state_machines_by_program("program_B")
+        
+        self.assertEqual(len(program_a), 2)
+        self.assertEqual(len(program_b), 1)
+        for s in program_a:
+            self.assertEqual(s["program_id"], "program_A")
+
+    def test_event_journal_record_and_get(self):
+        """Test recording and retrieving lifecycle events."""
+        task_id = "test_task_events"
+        event_identity = "evt_test_001"
+        
+        self._insert_task(task_id)
+        
+        # Record first event
+        success1 = self.store.record_task_event(
+            task_id=task_id,
+            event_type="TASK_STATE_CHANGED",
+            event_data={"old_state": "RUNNING", "new_state": "WAITING_EXTERNAL"},
+            event_identity=event_identity,
+            source_component="classifier"
+        )
+        self.assertTrue(success1)
+        
+        # Record duplicate should fail
+        success2 = self.store.record_task_event(
+            task_id=task_id,
+            event_type="TASK_STATE_CHANGED",
+            event_data={"old_state": "RUNNING", "new_state": "WAITING_EXTERNAL"},
+            event_identity=event_identity,
+            source_component="classifier"
+        )
+        self.assertFalse(success2)
+        
+        # Get events
+        events = self.store.get_task_events(task_id)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "TASK_STATE_CHANGED")
+        self.assertEqual(events[0]["event_identity"], event_identity)
+        
+        # Verify event data
+        import json
+        event_data = json.loads(events[0]["event_data_json"])
+        self.assertEqual(event_data["old_state"], "RUNNING")
+
+    def test_event_journal_multiple_events(self):
+        """Test multiple events for same task in order."""
+        task_id = "test_task_multi_events"
+        
+        self._insert_task(task_id)
+        
+        event_types = [
+            "TASK_STATE_CHANGED",
+            "WORKER_STARTED",
+            "CHECKPOINT_CREATED",
+            "RECOVERY_PLANNED",
+            "RECOVERY_COMPLETED",
+            "TASK_COMPLETED",
+        ]
+        
+        for i, et in enumerate(event_types):
+            event_identity = f"evt_{task_id}_{i}"
+            self.store.record_task_event(
+                task_id=task_id,
+                event_type=et,
+                event_data={"step": i},
+                event_identity=event_identity,
+                source_component="watchdog"
+            )
+        
+        events = self.store.get_task_events(task_id)
+        self.assertEqual(len(events), 6)
+        
+        # Verify order
+        for i, event in enumerate(events):
+            self.assertEqual(event["event_type"], event_types[i])
+
+    def test_side_effect_state_transitions(self):
+        """Test side effect state transitions (NONE -> KNOWN_COMPLETE -> UNKNOWN etc)."""
+        task_id = "test_side_effects"
+        self._insert_task(task_id)
+        state = {
+            "task_id": task_id,
+            "program_id": "test_program",
+            "generation": 1,
+            "goal": "Test side effects",
+            "capability": "codex",
+            "side_effect_state": "NONE",
+        }
+        self.store.upsert_task_state_machine(state)
+        
+        # Transition to KNOWN_COMPLETE
+        retrieved = self.store.get_task_state_machine(task_id)
+        retrieved["side_effect_state"] = "KNOWN_COMPLETE"
+        self.store.upsert_task_state_machine(retrieved)
+        
+        updated = self.store.get_task_state_machine(task_id)
+        self.assertEqual(updated["side_effect_state"], "KNOWN_COMPLETE")
+        
+        # Transition to UNKNOWN (tool process disappeared)
+        updated["side_effect_state"] = "UNKNOWN"
+        self.store.upsert_task_state_machine(updated)
+        
+        final = self.store.get_task_state_machine(task_id)
+        self.assertEqual(final["side_effect_state"], "UNKNOWN")
+
+    def test_checkpoint_hash_verification(self):
+        """Test checkpoint hash is stored and verified."""
+        task_id = "test_checkpoint_hash"
+        checkpoint_hash = "sha256:abc123def456"
+        
+        self._insert_task(task_id)
+        state = {
+            "task_id": task_id,
+            "program_id": "test_program",
+            "generation": 1,
+            "goal": "Test checkpoint",
+            "capability": "codex",
+            "checkpoint_hash": checkpoint_hash,
+        }
+        self.store.upsert_task_state_machine(state)
+        
+        retrieved = self.store.get_task_state_machine(task_id)
+        self.assertEqual(retrieved["checkpoint_hash"], checkpoint_hash)
+
+    def test_completed_boundaries_json(self):
+        """Test completed_boundaries stored as JSON."""
+        task_id = "test_completed_boundaries"
+        boundaries = ["boundary_0", "boundary_1", "boundary_2"]
+        boundaries_json = json.dumps(boundaries)
+        
+        self._insert_task(task_id)
+        state = {
+            "task_id": task_id,
+            "program_id": "test_program",
+            "generation": 1,
+            "goal": "Test boundaries",
+            "capability": "codex",
+            "completed_boundaries_json": boundaries_json,
+        }
+        self.store.upsert_task_state_machine(state)
+        
+        retrieved = self.store.get_task_state_machine(task_id)
+        self.assertEqual(retrieved["completed_boundaries_json"], boundaries_json)
+        
+        # Verify it's valid JSON and can be parsed back
+        parsed = json.loads(retrieved["completed_boundaries_json"])
+        self.assertEqual(parsed, boundaries)
+
+    def test_active_writer_identity_persistence(self):
+        """Test active_writer_identity is persisted for continuity."""
+        task_id = "test_writer_identity"
+        writer_identity = "codex:pid:12345:start_time:1788000000:cmd:codex exec"
+        
+        self._insert_task(task_id)
+        state = {
+            "task_id": task_id,
+            "program_id": "test_program",
+            "generation": 1,
+            "goal": "Test writer",
+            "capability": "codex",
+            "active_writer_identity": writer_identity,
+        }
+        self.store.upsert_task_state_machine(state)
+        
+        retrieved = self.store.get_task_state_machine(task_id)
+        self.assertEqual(retrieved["active_writer_identity"], writer_identity)
+        
+        # Simulate writer death - identity should still be queryable for reconciliation
+        # but a new writer would have a different identity
+        state["active_writer_identity"] = "codex:pid:67890:start_time:1788000100:cmd:codex exec"
+        self.store.upsert_task_state_machine(state)
+        
+        updated = self.store.get_task_state_machine(task_id)
+        self.assertEqual(updated["active_writer_identity"], "codex:pid:67890:start_time:1788000100:cmd:codex exec")
+
+
 class TestLeaseManager(unittest.TestCase):
     """Test lease management."""
     
@@ -1078,6 +1372,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestScheduler))
     suite.addTests(loader.loadTestsFromTestCase(TestHermesAdapter))
     suite.addTests(loader.loadTestsFromTestCase(TestIntegration))
+    suite.addTests(loader.loadTestsFromTestCase(TestV3DurableWorkflow))
     suite.addTests(loader.loadTestsFromTestCase(TestV2ContextResilience))
     
     runner = unittest.TextTestRunner(verbosity=2)

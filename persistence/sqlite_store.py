@@ -27,7 +27,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 -- Tasks discovered by the watchdog
@@ -118,6 +118,60 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
     FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_checkpoints_task_gen ON task_checkpoints(task_id, checkpoint_generation);
+
+-- V3: Canonical task execution state machine
+CREATE TABLE IF NOT EXISTS task_state_machine (
+    task_id TEXT PRIMARY KEY,
+    program_id TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    
+    -- Goal and capability
+    goal TEXT,
+    capability TEXT,
+    
+    -- Boundaries
+    first_unproven_boundary TEXT,
+    accepted_baseline TEXT,
+    completed_boundaries_json TEXT,
+    
+    -- Writer/transaction ownership
+    active_writer_identity TEXT,
+    active_transaction_id TEXT,
+    
+    -- Action tracking
+    pending_action TEXT,
+    last_completed_action TEXT,
+    
+    -- Side effect state: NONE, KNOWN_COMPLETE, KNOWN_FAILED, UNKNOWN
+    side_effect_state TEXT NOT NULL DEFAULT 'NONE',
+    
+    -- State version for optimistic locking
+    state_version INTEGER NOT NULL DEFAULT 1,
+    
+    -- Checkpoint verification
+    checkpoint_hash TEXT,
+    
+    -- Timestamps
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_state_machine_program ON task_state_machine(program_id);
+
+-- V3: Event journal for lifecycle transitions
+CREATE TABLE IF NOT EXISTS task_execution_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,  -- TASK_STATE_CHANGED, WORKER_STARTED, WORKER_EXITED, CHECKPOINT_CREATED, RECOVERY_PLANNED, RECOVERY_STARTED, RECOVERY_COMPLETED, SIDE_EFFECT_UNKNOWN, SIDE_EFFECT_RECONCILED, TASK_COMPLETED
+    event_data_json TEXT NOT NULL,
+    event_identity TEXT NOT NULL UNIQUE,  -- Stable event identity for deduplication
+    occurred_at REAL NOT NULL,
+    source_component TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_events_task_time ON task_execution_events(task_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_events_identity ON task_execution_events(event_identity);
 
 -- Recovery attempts (planned + executed)
 CREATE TABLE IF NOT EXISTS recovery_attempts (
@@ -526,3 +580,105 @@ class WatchdogStore:
             # Don't prune tasks - they're reference data
             conn.execute("DELETE FROM promotion_state WHERE updated_at < ?", (cutoff,))
             logger.info(f"Pruned watchdog data older than {retention_days} days")
+
+    # V3: Task State Machine operations
+    def upsert_task_state_machine(self, state: Dict) -> None:
+        """Upsert the canonical task execution state machine."""
+        with self._lock, self._transaction() as conn:
+            conn.execute("""
+                INSERT INTO task_state_machine (
+                    task_id, program_id, generation, goal, capability,
+                    first_unproven_boundary, accepted_baseline, completed_boundaries_json,
+                    active_writer_identity, active_transaction_id,
+                    pending_action, last_completed_action, side_effect_state,
+                    state_version, checkpoint_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    program_id=excluded.program_id,
+                    generation=excluded.generation,
+                    goal=excluded.goal,
+                    capability=excluded.capability,
+                    first_unproven_boundary=excluded.first_unproven_boundary,
+                    accepted_baseline=excluded.accepted_baseline,
+                    completed_boundaries_json=excluded.completed_boundaries_json,
+                    active_writer_identity=excluded.active_writer_identity,
+                    active_transaction_id=excluded.active_transaction_id,
+                    pending_action=excluded.pending_action,
+                    last_completed_action=excluded.last_completed_action,
+                    side_effect_state=excluded.side_effect_state,
+                    state_version=state_version + 1,
+                    checkpoint_hash=excluded.checkpoint_hash,
+                    updated_at=excluded.updated_at
+            """, (
+                state.get("task_id"), state.get("program_id"), state.get("generation", 1),
+                state.get("goal"), state.get("capability"),
+                state.get("first_unproven_boundary"), state.get("accepted_baseline"),
+                state.get("completed_boundaries_json"),
+                state.get("active_writer_identity"), state.get("active_transaction_id"),
+                state.get("pending_action"), state.get("last_completed_action"),
+                state.get("side_effect_state", "NONE"),
+                state.get("state_version", 1), state.get("checkpoint_hash"),
+                state.get("created_at", time.time()), time.time()
+            ))
+
+    def get_task_state_machine(self, task_id: str) -> Optional[Dict]:
+        """Get the canonical task execution state machine."""
+        with self._lock, self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_state_machine WHERE task_id=?", (task_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_task_state_machines_by_program(self, program_id: str) -> List[Dict]:
+        """Get all task state machines for a program."""
+        with self._lock, self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_state_machine WHERE program_id=? ORDER BY updated_at DESC", 
+                (program_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def increment_state_version(self, task_id: str, expected_version: int) -> bool:
+        """Optimistically increment state version. Returns True if successful."""
+        with self._lock, self._transaction() as conn:
+            cursor = conn.execute("""
+                UPDATE task_state_machine 
+                SET state_version = state_version + 1, updated_at = ?
+                WHERE task_id = ? AND state_version = ?
+            """, (time.time(), task_id, expected_version))
+            return cursor.rowcount > 0
+
+    # V3: Event Journal operations
+    def record_task_event(self, task_id: str, event_type: str, event_data: Dict, 
+                          event_identity: str, source_component: str) -> bool:
+        """Record a canonical lifecycle event. Returns False if event_identity already exists."""
+        with self._lock, self._transaction() as conn:
+            try:
+                conn.execute("""
+                    INSERT INTO task_execution_events (task_id, event_type, event_data_json, 
+                                                      event_identity, occurred_at, source_component)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (task_id, event_type, json.dumps(event_data), event_identity, 
+                      time.time(), source_component))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def get_task_events(self, task_id: str, since: float = 0) -> List[Dict]:
+        """Get all lifecycle events for a task since a timestamp."""
+        with self._lock, self._transaction() as conn:
+            rows = conn.execute("""
+                SELECT * FROM task_execution_events 
+                WHERE task_id=? AND occurred_at > ?
+                ORDER BY occurred_at
+            """, (task_id, since)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_recent_events(self, limit: int = 100) -> List[Dict]:
+        """Get recent lifecycle events across all tasks."""
+        with self._lock, self._transaction() as conn:
+            rows = conn.execute("""
+                SELECT * FROM task_execution_events 
+                ORDER BY occurred_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(row) for row in rows]
