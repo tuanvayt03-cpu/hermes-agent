@@ -1,0 +1,153 @@
+# Hermes Watchdog V1 Configuration
+# Global, project-agnostic watchdog for supervising Hermes/Codex tasks
+
+watchdog:
+  # Global scan interval in seconds
+  scan_interval_seconds: 60
+  
+  # Mode: OBSERVE | ACTIVE_CANARY | ACTIVE_GLOBAL
+  mode: "OBSERVE"
+  
+  # Persistence settings
+  persistence:
+    db_path: "~/AppData/Local/hermes/watchdog.db"
+    wal_mode: true
+    retention_days: 30
+  
+  # Recovery budgets by failure class
+  recovery_budgets:
+    PROVIDER_OVERLOAD:
+      backoff_seconds: [60, 120, 300, 600, 900]
+      recovery_window_seconds: 7200
+      max_retries: 5
+    NETWORK_TRANSIENT:
+      backoff_seconds: [60, 120, 300, 600]
+      recovery_window_seconds: 1800
+      max_retries: 4
+    HTTP_429_TEMP:
+      backoff_seconds: [60, 120, 300]
+      recovery_window_seconds: 1800
+      max_retries: 3
+      honor_retry_after: true
+    QUOTA_EXHAUSTED:
+      backoff_seconds: []
+      recovery_window_seconds: 0
+      max_retries: 0
+    AUTH_FAILURE:
+      backoff_seconds: []
+      recovery_window_seconds: 0
+      max_retries: 0
+    UNKNOWN:
+      backoff_seconds: []
+      recovery_window_seconds: 0
+      max_retries: 0
+  
+  # Lease settings
+  lease:
+    default_ttl_seconds: 300
+    max_generation: 1000
+  
+  # Capability probe settings
+  capabilities:
+    probe_on_startup: true
+    cache_ttl_seconds: 300
+  
+  # Shadow mode promotion criteria
+  shadow_promotion:
+    min_successful_scans: 10
+    require_live_task_discovery: true
+    require_duplicate_prevention_test: true
+    require_lease_behavior_test: true
+    require_observation_failure_safety_test: true
+  
+  # Canary mode settings
+  canary:
+    max_concurrent_recoveries: 1
+    preferred_recovery: "RETRY_TRANSPORT"
+    verification_required: true
+  
+  # Logging
+  logging:
+    level: "INFO"
+    structured_json: true
+    log_file: "~/AppData/Local/hermes/logs/watchdog.log"
+
+# Hermes adapter configuration
+hermes_adapter:
+  # Hermes installation root (auto-discovered if empty)
+  install_root: ""
+
+  # State database path (auto-discovered if empty)
+  state_db_path: ""
+
+  # Processes JSON path (auto-discovered if empty)
+  processes_json_path: ""
+
+  # Sessions directory (auto-discovered if empty)
+  sessions_dir: ""
+
+  # Session DB module import path
+  session_db_module: "hermes_state.SessionDB"
+
+  # Process registry module
+  process_registry_module: "tools.process_registry.process_registry"
+
+  # Delivery ledger module
+  delivery_ledger_module: "gateway.delivery_ledger"
+
+  # Supported capabilities to probe
+  capabilities_to_probe:
+    - "can_discover_tasks"
+    - "can_read_structured_status"
+    - "can_read_events"
+    - "can_retry_transport"
+    - "can_resume_session"
+    - "can_send_task_message"
+    - "can_read_quota_state"
+
+# Context budget configuration (V2)
+context_budget:
+  # Model context limits (tokens) - provider/model specific overrides can be added
+  default_context_limit: 128000
+  
+  # Safety margin (tokens) reserved for output + tool calls
+  reserved_output_tokens: 4096
+  reserved_tool_tokens: 8192
+  safety_margin: 2048
+  
+  # Thresholds as fraction of effective context budget
+  # below soft_threshold: normal request
+  # soft_threshold..hard_threshold: checkpoint + compact before next turn
+  # above hard_threshold: DO NOT SEND oversized request, compact first
+  soft_threshold: 0.75
+  hard_threshold: 0.90
+  
+  # Estimation settings
+  estimation:
+    # Use model metadata where available (authoritative)
+    use_model_metadata: true
+    # Fallback estimation method
+    fallback_method: "tiktoken_approx"
+    # Include tool schemas in estimation
+    include_tool_schemas: true
+    # Include system prompt in estimation
+    include_system_prompt: true
+    # History window for estimation (last N messages)
+    history_window_messages: 50
+
+# Task classification thresholds
+classification:
+  # Stall suspicion threshold (seconds of no progress)
+  suspected_stall_seconds: 300
+  
+  # Busy threshold - tool running but no agent text
+  busy_tool_max_seconds: 1800
+  
+  # Quota reset check interval
+  quota_reset_check_seconds: 3600
+  
+  # Max age for a task to be considered active
+  max_task_age_seconds: 86400
+  
+  # Require structured evidence for stall classification
+  require_structured_evidence: true

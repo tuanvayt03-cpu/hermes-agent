@@ -1,0 +1,3 @@
+# Hermes Watchdog V1 Requirements
+pyyaml>=6.0
+psutil>=5.9.0
