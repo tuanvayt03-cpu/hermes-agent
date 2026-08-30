@@ -10707,6 +10707,79 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def record_provider_error(
+        self,
+        session_id: str,
+        event_id: str,
+        occurred_at: float,
+        provider: str = "",
+        model: str = "",
+        http_status: Optional[int] = None,
+        error_code: Optional[str] = None,
+        error_class: Optional[str] = None,
+        sanitized_error_message: Optional[str] = None,
+        retryable: bool = False,
+        retry_after: Optional[float] = None,
+        reset_at: Optional[float] = None,
+        request_id: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        source_component: Optional[str] = None,
+    ) -> int:
+        """
+        Record a canonical provider error event for Watchdog observation.
+        
+        This persists structured provider error information that the Watchdog
+        can ingest to detect and classify provider failures.
+        
+        Args:
+            session_id: The session this error belongs to
+            event_id: Stable unique identifier for this error event (for deduplication)
+            occurred_at: Unix timestamp when the error occurred
+            provider: Provider name (e.g., "openrouter", "openai-codex")
+            model: Model name
+            http_status: HTTP status code (e.g., 502, 429, 401)
+            error_code: Provider-specific error code (e.g., "auth_unavailable")
+            error_class: Normalized error class (e.g., "AUTH_UNAVAILABLE", "NETWORK_TRANSIENT")
+            sanitized_error_message: Sanitized error message (no secrets)
+            retryable: Whether the error is retryable
+            retry_after: Seconds until retry (from Retry-After header)
+            reset_at: Unix timestamp when quota/limit resets
+            request_id: Provider request ID if available
+            stream_id: Stream identifier if applicable
+            source_component: Component that produced the error (e.g., "chat_completions", "auxiliary_client")
+        
+        Returns:
+            The inserted row ID
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO provider_errors (
+                    session_id, event_id, occurred_at, provider, model,
+                    http_status, error_code, error_class, sanitized_error_message,
+                    retryable, retry_after, reset_at, request_id, stream_id, source_component
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    event_id,
+                    occurred_at,
+                    provider,
+                    model,
+                    http_status,
+                    error_code,
+                    error_class,
+                    sanitized_error_message,
+                    1 if retryable else 0,
+                    retry_after,
+                    reset_at,
+                    request_id,
+                    stream_id,
+                    source_component,
+                ),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def append_messages_batch(
         self,
         session_id: str,

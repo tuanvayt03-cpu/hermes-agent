@@ -4806,6 +4806,35 @@ def run_conversation(
                     reason=classified.reason.value,
                 )
 
+                # ── Persist canonical provider error event for Watchdog ──
+                # Generate stable event identity for deduplication
+                _provider_error_event_id = f"prov_err:{session_id}:{api_call_count}:{classified.reason.value}:{hash(str(api_error)) % 1000000:06d}"
+                _provider_error_occurred_at = time.time()
+                _error_context = getattr(classified, "error_context", {}) or {}
+                try:
+                    _session_db = getattr(agent, "_session_db", None)
+                    if _session_db is not None:
+                        _session_db.record_provider_error(
+                            session_id=session_id,
+                            event_id=_provider_error_event_id,
+                            occurred_at=_provider_error_occurred_at,
+                            provider=getattr(agent, "provider", "") or "",
+                            model=getattr(agent, "model", "") or "",
+                            http_status=status_code,
+                            error_code=_error_context.get("reason") if isinstance(_error_context, dict) else None,
+                            error_class=classified.reason.value,
+                            sanitized_error_message=AIAgent._summarize_api_error(api_error) if hasattr(AIAgent, "_summarize_api_error") else str(api_error)[:500],
+                            retryable=classified.retryable,
+                            retry_after=_error_context.get("reset_at", time.time()) - time.time() if _error_context.get("reset_at") else None,
+                            reset_at=_error_context.get("reset_at") if isinstance(_error_context, dict) else None,
+                            request_id=api_request_id,
+                            stream_id=None,
+                            source_component="chat_completions",
+                        )
+                except Exception as _prov_err:
+                    # Never break the error path for observability failures
+                    logger.debug("Failed to record provider error: %s", _prov_err, exc_info=True)
+
                 if (
                     classified.reason == FailoverReason.billing
                     and _is_nous_inference_route(

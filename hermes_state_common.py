@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -528,6 +528,29 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claim TEXT,
     delivery_claimed_at REAL
 );
+
+CREATE TABLE IF NOT EXISTS provider_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    event_id TEXT NOT NULL,
+    occurred_at REAL NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    http_status INTEGER,
+    error_code TEXT,
+    error_class TEXT,
+    sanitized_error_message TEXT,
+    retryable INTEGER NOT NULL DEFAULT 0,
+    retry_after REAL,
+    reset_at REAL,
+    request_id TEXT,
+    stream_id TEXT,
+    source_component TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_errors_session ON provider_errors(session_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_provider_errors_event_id ON provider_errors(event_id);
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
