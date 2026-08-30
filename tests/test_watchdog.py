@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 # Add watchdog to path
 import sys
@@ -1265,6 +1266,572 @@ class TestRecoveryExecution(unittest.TestCase):
         attempt = self.store.get_recovery_attempt(plan.action_id)
         self.assertEqual(attempt["status"], "failed")
         self.assertFalse(self.store.has_action_idempotency_key(plan.idempotency_key))
+
+
+class TestMultiFailureBehavioralRecoverySoak(unittest.TestCase):
+    """Behavioral soak for sequential recovery on one synthetic master task."""
+
+    MASTER_TASK_ID = "synthetic_master_task"
+    PROGRAM_ID = "synthetic_program"
+    COMPLETED_BOUNDARIES = ["BOUNDARY_ACCEPTED_BASELINE"]
+
+    class SoakAdapter(HermesAdapter):
+        def __init__(self):
+            super().__init__({})
+            self.logical_time = 1_000.0
+            self.behavior = {}
+            self.execution_log = []
+            self.operator_continue_message_count = 0
+            self.operator_retry_click_count = 0
+
+        def set_behavior(self, scenario_name, action_behaviors):
+            self.behavior = {
+                "scenario_name": scenario_name,
+                "actions": action_behaviors,
+            }
+
+        def execute_recovery(self, action_type, task, params):
+            self.logical_time += 10.0
+            attempted_at = self.logical_time
+            action_behavior = self.behavior["actions"].get(action_type, {})
+            self.execution_log.append({
+                "scenario": self.behavior["scenario_name"],
+                "action_type": action_type,
+                "task_id": task.task_id,
+                "previous_boundary": params.get("_first_unproven_boundary"),
+            })
+            if action_behavior.get("mutate"):
+                self._apply_task_progress(task, attempted_at, action_behavior)
+            return {
+                "success": action_behavior.get("success", True),
+                "action": action_type,
+                "details": action_behavior.get("details", action_type),
+                "attempted_at": attempted_at,
+            }
+
+        def _apply_task_progress(self, task, attempted_at, action_behavior):
+            if action_behavior.get("clear_provider_state", True):
+                task.provider_request_state = ""
+            if action_behavior.get("provider_activity"):
+                task.last_provider_request_at = attempted_at + 1
+            if action_behavior.get("assistant_activity"):
+                task.last_agent_event_at = attempted_at + 2
+            if action_behavior.get("tool_activity"):
+                task.last_tool_start_at = attempted_at + 1
+                task.last_tool_end_at = attempted_at + 2
+            if action_behavior.get("advance_boundary"):
+                task.metadata = dict(task.metadata)
+                task.metadata["first_unproven_boundary"] = action_behavior["advance_boundary"]
+                task.first_unproven_boundary = action_behavior["advance_boundary"]
+            if action_behavior.get("terminal_complete"):
+                task.structured_state = "COMPLETE"
+                task.explicit_markers = dict(task.explicit_markers)
+                task.explicit_markers["status"] = "COMPLETE"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test_watchdog.db")
+        self.store = WatchdogStore(self.db_path)
+        self.classifier = LifecycleClassifier({
+            "classification": {
+                "suspected_stall_seconds": 300,
+                "busy_tool_max_seconds": 1800,
+                "max_task_age_seconds": 86400,
+                "require_structured_evidence": True,
+            }
+        })
+        self.adapter = self.SoakAdapter()
+        self.master_task = MockTask(
+            task_id=self.MASTER_TASK_ID,
+            session_id="synthetic_session",
+            session_key="synthetic_key",
+            structured_state="RUNNING",
+            metadata={"first_unproven_boundary": "BOUNDARY_BOOTSTRAP"},
+            first_unproven_boundary="BOUNDARY_BOOTSTRAP",
+            last_agent_event_at=100.0,
+            last_tool_start_at=0.0,
+            last_tool_end_at=0.0,
+            last_provider_request_at=0.0,
+            explicit_markers={},
+        )
+        self._insert_master_task()
+        self.store.upsert_task_state_machine({
+            "task_id": self.MASTER_TASK_ID,
+            "program_id": self.PROGRAM_ID,
+            "generation": 1,
+            "goal": "MULTI_FAILURE_BEHAVIORAL_RECOVERY_SOAK",
+            "capability": "codex",
+            "first_unproven_boundary": "BOUNDARY_BOOTSTRAP",
+            "completed_boundaries_json": json.dumps(self.COMPLETED_BOUNDARIES),
+            "pending_action": None,
+            "last_completed_action": None,
+            "side_effect_state": "NONE",
+            "state_version": 1,
+        })
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _insert_master_task(self):
+        self.store.upsert_task(TaskRecord(
+            task_id=self.MASTER_TASK_ID,
+            session_id="synthetic_session",
+            session_key="synthetic_key",
+            source="desktop",
+            platform="local",
+            cwd="/synthetic",
+            git_repo_root="/synthetic",
+            first_seen_at=time.time(),
+            last_seen_at=time.time(),
+            last_activity_at=time.time(),
+            last_activity_description="synthetic soak",
+            structured_state="RUNNING",
+            is_active=1,
+            metadata_json=json.dumps({"goal": "MULTI_FAILURE_BEHAVIORAL_RECOVERY_SOAK"}),
+        ))
+
+    def _capabilities(self, **overrides):
+        base = {
+            "can_retry_transport": True,
+            "can_retry_model_provider": True,
+            "can_resume_session": True,
+            "can_switch_model_provider": False,
+            "can_resume_worker_from_checkpoint": True,
+            "can_send_task_message": True,
+            "can_compact_context": True,
+            "can_reconcile_side_effect": True,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _build_watchdog(self, capabilities):
+        from watchdog import HermesWatchdog
+
+        watchdog = HermesWatchdog.__new__(HermesWatchdog)
+        watchdog.store = self.store
+        watchdog.mode = "ACTIVE_GLOBAL"
+        watchdog.watchdog_id = "soak_watchdog"
+        watchdog.capabilities = capabilities
+        watchdog.lease_manager = LeaseManager(self.store, {"lease": {"default_ttl_seconds": 300}})
+        watchdog.adapter = self.adapter
+        return watchdog
+
+    def _planner(self, capabilities):
+        from core.recovery_planner import RecoveryPlanner
+
+        return RecoveryPlanner(
+            {
+                "recovery_budgets": {
+                    FailureClass.PROVIDER_OVERLOAD: {"max_retries": 2},
+                    FailureClass.NETWORK_TRANSIENT: {"max_retries": 2},
+                    FailureClass.HTTP_429_TEMP: {"max_retries": 2},
+                    FailureClass.CONTEXT_WINDOW_EXCEEDED: {"max_retries": 1},
+                    FailureClass.UNKNOWN: {"max_retries": 1},
+                }
+            },
+            capabilities,
+        )
+
+    def _current_boundary(self):
+        return (
+            self.master_task.first_unproven_boundary
+            or self.master_task.metadata.get("first_unproven_boundary")
+        )
+
+    def _persist_verified_state(self, last_action, side_effect_state="NONE"):
+        state = self.store.get_task_state_machine(self.MASTER_TASK_ID)
+        state.update({
+            "program_id": self.PROGRAM_ID,
+            "generation": 1,
+            "goal": "MULTI_FAILURE_BEHAVIORAL_RECOVERY_SOAK",
+            "capability": "codex",
+            "first_unproven_boundary": self._current_boundary(),
+            "completed_boundaries_json": json.dumps(self.COMPLETED_BOUNDARIES),
+            "pending_action": None,
+            "last_completed_action": last_action,
+            "side_effect_state": side_effect_state,
+            "checkpoint_hash": None,
+        })
+        self.store.upsert_task_state_machine(state)
+
+    def _rebaseline_after_failed_primitive(self, failed_action):
+        state = self.store.get_task_state_machine(self.MASTER_TASK_ID)
+        state.update({
+            "program_id": self.PROGRAM_ID,
+            "generation": 1,
+            "goal": "MULTI_FAILURE_BEHAVIORAL_RECOVERY_SOAK",
+            "capability": "codex",
+            "first_unproven_boundary": self._current_boundary(),
+            "completed_boundaries_json": json.dumps(self.COMPLETED_BOUNDARIES),
+            "pending_action": None,
+            "last_completed_action": failed_action,
+            "checkpoint_hash": None,
+        })
+        self.store.upsert_task_state_machine(state)
+
+    def _scenario_counters(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped_count,
+                    COUNT(*) AS attempt_count
+                FROM recovery_attempts
+                WHERE task_id = ?
+                """,
+                (self.MASTER_TASK_ID,),
+            ).fetchone()
+            return dict(row)
+
+    def _execute_single_plan(self, watchdog, planner, classification, invalidators=None, checkpoint_valid=True):
+        durable_state = self.store.get_task_state_machine(self.MASTER_TASK_ID)
+        plans = planner.plan_recovery(
+            self.master_task,
+            classification,
+            self.store,
+            watchdog.watchdog_id,
+            durable_state=durable_state,
+            checkpoint_valid=checkpoint_valid,
+            invalidators=invalidators,
+        )
+        self.assertEqual(len(plans), 1)
+        plan = plans[0]
+        success = watchdog._execute_recovery(plan, self.master_task)
+        attempt = self.store.get_recovery_attempt(plan.action_id)
+        result_payload = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
+        return plan, success, attempt, result_payload
+
+    def test_multi_failure_behavioral_recovery_soak(self):
+        scenarios = [
+            {
+                "name": "timeout_streaming_504",
+                "prepare": lambda: self._prepare_provider_fault("TIMEOUT", "evt_timeout_504", 504),
+                "capabilities": self._capabilities(),
+                "classification": lambda: self.classifier.classify(self.master_task),
+                "behavior": {
+                    "MODEL_PROVIDER_RETRY": {
+                        "success": False,
+                        "details": "synthetic retry observed later provider activity",
+                        "mutate": True,
+                        "provider_activity": True,
+                        "assistant_activity": True,
+                        "advance_boundary": "BOUNDARY_AFTER_TIMEOUT_504",
+                    }
+                },
+                "expected_action": RecoveryAction.MODEL_PROVIDER_RETRY,
+                "expected_final_action": RecoveryAction.MODEL_PROVIDER_RETRY,
+                "side_effect_state": "NONE",
+            },
+            {
+                "name": "provider_rate_limit_429",
+                "prepare": lambda: self._prepare_provider_fault("RATE_LIMITED", "evt_rate_limit_429", 429),
+                "capabilities": self._capabilities(),
+                "classification": lambda: self.classifier.classify(self.master_task),
+                "behavior": {
+                    "MODEL_PROVIDER_RETRY": {
+                        "success": False,
+                        "details": "synthetic retry observed boundary advancement",
+                        "mutate": True,
+                        "assistant_activity": True,
+                        "advance_boundary": "BOUNDARY_AFTER_RATE_LIMIT",
+                    }
+                },
+                "expected_action": RecoveryAction.MODEL_PROVIDER_RETRY,
+                "expected_final_action": RecoveryAction.MODEL_PROVIDER_RETRY,
+                "side_effect_state": "NONE",
+            },
+            {
+                "name": "context_window_failure",
+                "prepare": self._prepare_context_fault,
+                "capabilities": self._capabilities(),
+                "classification": lambda: self.classifier.classify(self.master_task),
+                "behavior": {
+                    "COMPACT_CONTEXT": {
+                        "success": True,
+                        "details": "synthetic compaction with tool progress",
+                        "mutate": True,
+                        "tool_activity": True,
+                        "advance_boundary": "BOUNDARY_AFTER_COMPACTION",
+                    }
+                },
+                "expected_action": RecoveryAction.COMPACT_CONTEXT,
+                "expected_final_action": RecoveryAction.COMPACT_CONTEXT,
+                "side_effect_state": "NONE",
+            },
+            {
+                "name": "worker_process_death",
+                "prepare": self._prepare_stall_fault,
+                "capabilities": self._capabilities(),
+                "classification": lambda: self.classifier.classify(self.master_task),
+                "behavior": {
+                    "NUDGE_AGENT": {
+                        "success": True,
+                        "details": "synthetic nudge followed by assistant activity",
+                        "mutate": True,
+                        "assistant_activity": True,
+                        "advance_boundary": "BOUNDARY_AFTER_WORKER_DEATH",
+                    }
+                },
+                "expected_action": RecoveryAction.NUDGE_AGENT,
+                "expected_final_action": RecoveryAction.NUDGE_AGENT,
+                "side_effect_state": "NONE",
+            },
+            {
+                "name": "watchdog_restart",
+                "prepare": lambda: self._prepare_provider_fault("TIMEOUT", "evt_restart_timeout", 504),
+                "capabilities": self._capabilities(
+                    can_retry_model_provider=False,
+                    can_resume_session=True,
+                    can_resume_worker_from_checkpoint=True,
+                ),
+                "classification": lambda: self.classifier.classify(self.master_task),
+                "behavior": {
+                    "SESSION_RESUME_FROM_CHECKPOINT": {
+                        "success": False,
+                        "details": "synthetic session resume failed without proof",
+                        "mutate": False,
+                    }
+                },
+                "expected_action": RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT,
+                "restart_behavior": {
+                    "WORKER_RESUME_FROM_CHECKPOINT": {
+                        "success": True,
+                        "details": "synthetic worker recovery observed later activity",
+                        "mutate": True,
+                        "assistant_activity": True,
+                        "tool_activity": True,
+                        "advance_boundary": "BOUNDARY_AFTER_WATCHDOG_RESTART",
+                    }
+                },
+                "restart_capabilities": self._capabilities(
+                    can_retry_model_provider=False,
+                    can_resume_session=False,
+                    can_resume_worker_from_checkpoint=True,
+                ),
+                "expected_final_action": RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT,
+                "side_effect_state": "NONE",
+            },
+            {
+                "name": "unknown_known_no_effect",
+                "prepare": self._prepare_unknown_known_no_effect,
+                "capabilities": self._capabilities(),
+                "classification": self._classification_unknown_verify,
+                "behavior": {
+                    "VERIFY_RECOVERY": {
+                        "success": True,
+                        "details": "synthetic reconciliation observed continued execution",
+                        "mutate": True,
+                        "assistant_activity": True,
+                        "advance_boundary": "BOUNDARY_AFTER_UNKNOWN_VERIFY",
+                    }
+                },
+                "expected_action": RecoveryAction.VERIFY_RECOVERY,
+                "expected_final_action": RecoveryAction.VERIFY_RECOVERY,
+                "invalidators": ["KNOWN_NO_EFFECT"],
+                "side_effect_state": "NONE",
+            },
+            {
+                "name": "unknown_side_effect_reconciliation",
+                "prepare": self._prepare_unknown_side_effect,
+                "capabilities": self._capabilities(),
+                "classification": self._classification_unknown_reconcile,
+                "behavior": {
+                    "RECONCILE_SIDE_EFFECT": {
+                        "success": True,
+                        "details": "synthetic side-effect reconciliation reached completion",
+                        "mutate": True,
+                        "tool_activity": True,
+                        "terminal_complete": True,
+                        "advance_boundary": "BOUNDARY_AFTER_SIDE_EFFECT_RECONCILED",
+                    }
+                },
+                "expected_action": RecoveryAction.RECONCILE_SIDE_EFFECT,
+                "expected_final_action": RecoveryAction.RECONCILE_SIDE_EFFECT,
+                "side_effect_state": "KNOWN_COMPLETE",
+            },
+        ]
+
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario["name"]):
+                before = self._scenario_counters()
+                scenario["prepare"]()
+                self.adapter.set_behavior(scenario["name"], scenario["behavior"])
+                watchdog = self._build_watchdog(scenario["capabilities"])
+                planner = self._planner(scenario["capabilities"])
+                plan, success, attempt, payload = self._execute_single_plan(
+                    watchdog,
+                    planner,
+                    scenario["classification"](),
+                    invalidators=scenario.get("invalidators"),
+                )
+                self.assertEqual(plan.action_type, scenario["expected_action"])
+
+                final_plan = plan
+                final_success = success
+                final_attempt = attempt
+                final_payload = payload
+
+                if scenario["name"] == "watchdog_restart":
+                    self.assertFalse(success)
+                    self._rebaseline_after_failed_primitive(plan.action_type)
+                    restart_capabilities = scenario["restart_capabilities"]
+                    self.adapter.set_behavior(scenario["name"], scenario["restart_behavior"])
+                    restarted_watchdog = self._build_watchdog(restart_capabilities)
+                    restarted_watchdog.watchdog_id = "soak_watchdog_restarted"
+                    restarted_planner = self._planner(restart_capabilities)
+                    final_plan, final_success, final_attempt, final_payload = self._execute_single_plan(
+                        restarted_watchdog,
+                        restarted_planner,
+                        scenario["classification"](),
+                    )
+
+                self.assertEqual(final_plan.action_type, scenario["expected_final_action"])
+                self.assertTrue(final_success)
+                self.assertEqual(final_attempt["status"], "executed")
+                self.assertTrue(final_payload["verification"]["verified"])
+
+                self._persist_verified_state(
+                    final_plan.action_type,
+                    side_effect_state=scenario["side_effect_state"],
+                )
+
+                after = self._scenario_counters()
+                state = self.store.get_task_state_machine(self.MASTER_TASK_ID)
+                execution_entries = [
+                    entry for entry in self.adapter.execution_log
+                    if entry["scenario"] == scenario["name"]
+                ]
+                duplicate_recovery_action_count = after["skipped_count"] - before["skipped_count"]
+                completed_boundary_replay_count = sum(
+                    1 for entry in execution_entries
+                    if entry["previous_boundary"] in self.COMPLETED_BOUNDARIES
+                )
+                unknown_side_effect_replay_count = max(
+                    0,
+                    sum(
+                        1 for entry in execution_entries
+                        if entry["action_type"] == RecoveryAction.RECONCILE_SIDE_EFFECT
+                    ) - 1,
+                )
+
+                self.assertTrue(all(entry["task_id"] == self.MASTER_TASK_ID for entry in execution_entries))
+                self.assertEqual(state["program_id"], self.PROGRAM_ID)
+                self.assertEqual(completed_boundary_replay_count, 0)
+                self.assertEqual(duplicate_recovery_action_count, 0)
+                self.assertEqual(unknown_side_effect_replay_count, 0)
+                self.assertEqual(self.adapter.operator_continue_message_count, 0)
+                self.assertEqual(self.adapter.operator_retry_click_count, 0)
+
+    def _prepare_provider_fault(self, provider_state, event_id, http_status):
+        previous_boundary = self._current_boundary()
+        self.master_task.structured_state = "RUNNING"
+        self.master_task.provider_request_state = provider_state
+        self.master_task.structured_provider_error = {
+            "event_id": event_id,
+            "http_status": http_status,
+            "timestamp": self.adapter.logical_time,
+        }
+        self.master_task.last_provider_request_at = self.adapter.logical_time
+        self.master_task.last_agent_event_at = self.adapter.logical_time - 5
+        self.master_task.last_tool_start_at = self.adapter.logical_time - 5
+        self.master_task.last_tool_end_at = self.adapter.logical_time - 5
+        self.master_task.worker_process_alive = True
+        self.master_task.subprocess_active = False
+        self.master_task.explicit_markers = {}
+        self.master_task.metadata = {"first_unproven_boundary": previous_boundary}
+        self.master_task.first_unproven_boundary = previous_boundary
+        state = self.store.get_task_state_machine(self.MASTER_TASK_ID)
+        state["side_effect_state"] = "NONE"
+        state["pending_action"] = None
+        self.store.upsert_task_state_machine(state)
+
+    def _prepare_context_fault(self):
+        previous_boundary = self._current_boundary()
+        self.master_task.structured_state = "RUNNING"
+        self.master_task.provider_request_state = "CONTEXT_WINDOW_EXCEEDED"
+        self.master_task.structured_provider_error = {
+            "event_id": "evt_context_window",
+            "http_status": 400,
+            "timestamp": self.adapter.logical_time,
+        }
+        self.master_task.last_provider_request_at = self.adapter.logical_time
+        self.master_task.explicit_markers = {}
+        self.master_task.metadata = {"first_unproven_boundary": previous_boundary}
+        self.master_task.first_unproven_boundary = previous_boundary
+
+    def _prepare_stall_fault(self):
+        previous_boundary = self._current_boundary()
+        now = time.time()
+        self.master_task.structured_state = "RUNNING"
+        self.master_task.provider_request_state = ""
+        self.master_task.structured_provider_error = None
+        self.master_task.worker_process_alive = False
+        self.master_task.subprocess_active = False
+        self.master_task.last_activity_at = now - 1000
+        self.master_task.last_agent_event_at = now - 1000
+        self.master_task.last_tool_start_at = now - 4000
+        self.master_task.last_tool_end_at = now - 4000
+        self.master_task.explicit_markers = {}
+        self.master_task.metadata = {"first_unproven_boundary": previous_boundary}
+        self.master_task.first_unproven_boundary = previous_boundary
+
+    def _prepare_unknown_known_no_effect(self):
+        previous_boundary = self._current_boundary()
+        self.master_task.structured_state = "RUNNING"
+        self.master_task.provider_request_state = ""
+        self.master_task.structured_provider_error = {
+            "event_id": "evt_unknown_no_effect",
+            "http_status": 0,
+            "timestamp": self.adapter.logical_time,
+        }
+        self.master_task.worker_process_alive = True
+        self.master_task.subprocess_active = False
+        self.master_task.explicit_markers = {}
+        self.master_task.metadata = {"first_unproven_boundary": previous_boundary}
+        self.master_task.first_unproven_boundary = previous_boundary
+        state = self.store.get_task_state_machine(self.MASTER_TASK_ID)
+        state["side_effect_state"] = "NONE"
+        state["pending_action"] = None
+        self.store.upsert_task_state_machine(state)
+
+    def _prepare_unknown_side_effect(self):
+        previous_boundary = self._current_boundary()
+        self.master_task.structured_state = "RUNNING"
+        self.master_task.provider_request_state = ""
+        self.master_task.structured_provider_error = {
+            "event_id": "evt_unknown_side_effect",
+            "http_status": 0,
+            "timestamp": self.adapter.logical_time,
+        }
+        self.master_task.explicit_markers = {}
+        self.master_task.metadata = {"first_unproven_boundary": previous_boundary}
+        self.master_task.first_unproven_boundary = previous_boundary
+        state = self.store.get_task_state_machine(self.MASTER_TASK_ID)
+        state["side_effect_state"] = "UNKNOWN"
+        state["pending_action"] = "write_file"
+        self.store.upsert_task_state_machine(state)
+
+    def _classification_unknown_verify(self):
+        return ClassificationResult(
+            state=LifecycleState.TRANSIENT_FAILURE,
+            confidence=0.8,
+            failure_class=FailureClass.UNKNOWN,
+            recovery_action=RecoveryAction.NO_ACTION,
+            evidence={},
+            reasoning="Unknown failure with known no effect",
+        )
+
+    def _classification_unknown_reconcile(self):
+        return ClassificationResult(
+            state=LifecycleState.RECOVERY_PENDING,
+            confidence=0.9,
+            failure_class=FailureClass.UNKNOWN,
+            recovery_action=RecoveryAction.RECONCILE_SIDE_EFFECT,
+            evidence={},
+            reasoning="Unknown side effect requires reconciliation",
+        )
 
 
 class TestLeaseManager(unittest.TestCase):

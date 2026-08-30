@@ -755,18 +755,26 @@ class HermesAdapter:
             "RESUME_SESSION",
             "NUDGE_AGENT",
         ):
-            verification["verified"] = bool(result.get("success"))
-            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
-            verification["details"] = result.get("details", "")
+            progress_evidence = self._collect_runtime_progress_evidence(task, params)
+            evidence.update(progress_evidence)
+            verification["verified"] = progress_evidence["has_effect_evidence"]
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "PENDING"
+            verification["details"] = progress_evidence["details"]
         elif action_type == "VERIFY_RECOVERY":
+            progress_evidence = self._collect_runtime_progress_evidence(task, params)
+            evidence.update(progress_evidence)
             still_invalidated = bool(task.explicit_markers.get("invalidate_checkpoint"))
             still_faulting = bool(getattr(task, "provider_request_state", ""))
-            verification["verified"] = not still_invalidated and not still_faulting
+            verification["verified"] = (
+                not still_invalidated
+                and not still_faulting
+                and progress_evidence["has_effect_evidence"]
+            )
             verification["effect_state"] = "VERIFIED" if verification["verified"] else "PENDING"
             verification["details"] = (
                 "Recovery authority verified from current task evidence"
                 if verification["verified"]
-                else "Current task evidence still shows an open invalidator or active fault"
+                else "Current task evidence does not yet prove recovery or still shows an open invalidator/fault"
             )
 
         return verification
@@ -811,6 +819,7 @@ class HermesAdapter:
         )
         previous_boundary = fault_evidence.get("first_unproven_boundary")
         current_boundary = self._current_first_unproven_boundary(task)
+        terminal_complete = self._is_terminal_completion(task)
 
         later_provider_activity = bool(fault_at and getattr(task, "last_provider_request_at", 0) > fault_at)
         later_assistant_activity = bool(fault_at and getattr(task, "last_agent_event_at", 0) > fault_at)
@@ -830,6 +839,7 @@ class HermesAdapter:
             or later_assistant_activity
             or later_tool_activity
             or boundary_advanced
+            or terminal_complete
         )
 
         if has_effect_evidence:
@@ -842,11 +852,13 @@ class HermesAdapter:
                 parts.append("tool activity")
             if boundary_advanced:
                 parts.append("FIRST_UNPROVEN_BOUNDARY advancement")
+            if terminal_complete:
+                parts.append("terminal completion")
             details = "Model-provider recovery evidenced by " + ", ".join(parts)
         else:
             details = (
                 "No later provider/assistant/tool activity and no "
-                "FIRST_UNPROVEN_BOUNDARY advancement observed after the provider fault"
+                "FIRST_UNPROVEN_BOUNDARY advancement or terminal completion observed after the provider fault"
             )
 
         return {
@@ -857,6 +869,75 @@ class HermesAdapter:
             "later_assistant_activity": later_assistant_activity,
             "later_tool_activity": later_tool_activity,
             "first_unproven_boundary_advanced": boundary_advanced,
+            "terminal_complete": terminal_complete,
+            "has_effect_evidence": has_effect_evidence,
+            "details": details,
+        }
+
+    def _is_terminal_completion(self, task: DiscoveredTask) -> bool:
+        markers = getattr(task, "explicit_markers", {}) or {}
+        return getattr(task, "structured_state", "") in ("COMPLETE", "FINISHED", "SUCCESS") or (
+            markers.get("completion_marker") or markers.get("status") == "COMPLETE"
+        )
+
+    def _collect_runtime_progress_evidence(self, task: DiscoveredTask, params: Dict) -> Dict:
+        """Require post-action runtime progress instead of trusting executor return values."""
+        attempted_at = float(params.get("_attempted_at") or 0)
+        previous_boundary = (
+            params.get("_first_unproven_boundary")
+            or (params.get("_fault_envelope") or {}).get("evidence", {}).get("first_unproven_boundary")
+        )
+        current_boundary = self._current_first_unproven_boundary(task)
+        terminal_complete = self._is_terminal_completion(task)
+        later_provider_activity = bool(attempted_at and getattr(task, "last_provider_request_at", 0) > attempted_at)
+        later_assistant_activity = bool(attempted_at and getattr(task, "last_agent_event_at", 0) > attempted_at)
+        later_tool_activity = bool(
+            attempted_at and (
+                getattr(task, "last_tool_start_at", 0) > attempted_at
+                or getattr(task, "last_tool_end_at", 0) > attempted_at
+            )
+        )
+        boundary_advanced = bool(
+            previous_boundary
+            and current_boundary
+            and current_boundary != previous_boundary
+        )
+        has_effect_evidence = (
+            later_provider_activity
+            or later_assistant_activity
+            or later_tool_activity
+            or boundary_advanced
+            or terminal_complete
+        )
+
+        if has_effect_evidence:
+            parts = []
+            if later_provider_activity:
+                parts.append("provider activity")
+            if later_assistant_activity:
+                parts.append("assistant activity")
+            if later_tool_activity:
+                parts.append("tool activity")
+            if boundary_advanced:
+                parts.append("FIRST_UNPROVEN_BOUNDARY advancement")
+            if terminal_complete:
+                parts.append("terminal completion")
+            details = "Recovery effect evidenced by " + ", ".join(parts)
+        else:
+            details = (
+                "No later provider/assistant/tool activity and no "
+                "FIRST_UNPROVEN_BOUNDARY advancement or terminal completion observed after recovery"
+            )
+
+        return {
+            "attempted_at": attempted_at,
+            "previous_first_unproven_boundary": previous_boundary,
+            "current_first_unproven_boundary": current_boundary,
+            "later_provider_activity": later_provider_activity,
+            "later_assistant_activity": later_assistant_activity,
+            "later_tool_activity": later_tool_activity,
+            "first_unproven_boundary_advanced": boundary_advanced,
+            "terminal_complete": terminal_complete,
             "has_effect_evidence": has_effect_evidence,
             "details": details,
         }

@@ -146,7 +146,10 @@ class RecoveryPlanner:
         if not fault:
             return False
         for primitive in self.registry.primitives_for_domain(fault.domain):
-            if primitive.action_type != RecoveryAction.NUDGE_AGENT:
+            if primitive.action_type not in (
+                RecoveryAction.NUDGE_AGENT,
+                RecoveryAction.VERIFY_RECOVERY,
+            ):
                 return True
         return False
 
