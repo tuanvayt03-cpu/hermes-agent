@@ -14,26 +14,41 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from core.classifier import FailureClass, LifecycleState, RecoveryAction
 
 
-FAULT_DOMAIN_TRANSPORT = "transport"
+FAULT_DOMAIN_MODEL_PROVIDER = "model_provider"
+FAULT_DOMAIN_TELEGRAM_DELIVERY = "telegram_delivery"
 FAULT_DOMAIN_CONTEXT = "context"
 FAULT_DOMAIN_SIDE_EFFECT = "side_effect"
 FAULT_DOMAIN_SESSION = "session"
-FAULT_DOMAIN_AGENT = "agent"
+FAULT_DOMAIN_TOOL = "tool"
+FAULT_DOMAIN_PROCESS = "process"
+FAULT_DOMAIN_GATEWAY = "gateway"
+FAULT_DOMAIN_GIT = "git"
+FAULT_DOMAIN_UNKNOWN = "unknown"
 FAULT_DOMAIN_VERIFY = "verify"
 
 
+CHECKPOINT_OPTIONAL_DOMAINS = {
+    FAULT_DOMAIN_MODEL_PROVIDER,
+    FAULT_DOMAIN_TELEGRAM_DELIVERY,
+}
+
+
 FAILURE_CLASS_TO_DOMAIN = {
-    FailureClass.PROVIDER_OVERLOAD: FAULT_DOMAIN_TRANSPORT,
-    FailureClass.NETWORK_TRANSIENT: FAULT_DOMAIN_TRANSPORT,
-    FailureClass.HTTP_429_TEMP: FAULT_DOMAIN_TRANSPORT,
+    FailureClass.PROVIDER_OVERLOAD: FAULT_DOMAIN_MODEL_PROVIDER,
+    FailureClass.NETWORK_TRANSIENT: FAULT_DOMAIN_MODEL_PROVIDER,
+    FailureClass.HTTP_429_TEMP: FAULT_DOMAIN_MODEL_PROVIDER,
     FailureClass.CONTEXT_WINDOW_EXCEEDED: FAULT_DOMAIN_CONTEXT,
-    FailureClass.UNKNOWN: FAULT_DOMAIN_SIDE_EFFECT,
+    FailureClass.UNKNOWN: FAULT_DOMAIN_UNKNOWN,
 }
 
 ACTION_TYPE_TO_DOMAIN = {
-    RecoveryAction.RETRY_TRANSPORT: FAULT_DOMAIN_TRANSPORT,
+    RecoveryAction.MODEL_PROVIDER_RETRY: FAULT_DOMAIN_MODEL_PROVIDER,
+    RecoveryAction.MODEL_PROVIDER_SWITCH: FAULT_DOMAIN_MODEL_PROVIDER,
+    RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT: FAULT_DOMAIN_SESSION,
+    RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT: FAULT_DOMAIN_PROCESS,
+    RecoveryAction.RETRY_TRANSPORT: FAULT_DOMAIN_TELEGRAM_DELIVERY,
     RecoveryAction.RESUME_SESSION: FAULT_DOMAIN_SESSION,
-    RecoveryAction.NUDGE_AGENT: FAULT_DOMAIN_AGENT,
+    RecoveryAction.NUDGE_AGENT: FAULT_DOMAIN_PROCESS,
     RecoveryAction.COMPACT_CONTEXT: FAULT_DOMAIN_CONTEXT,
     RecoveryAction.RECONCILE_SIDE_EFFECT: FAULT_DOMAIN_SIDE_EFFECT,
     RecoveryAction.VERIFY_RECOVERY: FAULT_DOMAIN_VERIFY,
@@ -96,15 +111,46 @@ class RecoveryCapabilityRegistry:
 
     DEFAULT_PRIMITIVES: Tuple[RecoveryPrimitive, ...] = (
         RecoveryPrimitive(
+            action_type=RecoveryAction.MODEL_PROVIDER_RETRY,
+            domains=(FAULT_DOMAIN_MODEL_PROVIDER,),
+            capability_flag="can_retry_model_provider",
+            priority=0,
+            invasive=False,
+        ),
+        RecoveryPrimitive(
+            action_type=RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT,
+            domains=(FAULT_DOMAIN_MODEL_PROVIDER,),
+            capability_flag="can_resume_session",
+            priority=1,
+            requires_checkpoint=True,
+            invasive=True,
+        ),
+        RecoveryPrimitive(
+            action_type=RecoveryAction.MODEL_PROVIDER_SWITCH,
+            domains=(FAULT_DOMAIN_MODEL_PROVIDER,),
+            capability_flag="can_switch_model_provider",
+            priority=2,
+            requires_checkpoint=True,
+            invasive=True,
+        ),
+        RecoveryPrimitive(
+            action_type=RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT,
+            domains=(FAULT_DOMAIN_MODEL_PROVIDER,),
+            capability_flag="can_resume_worker_from_checkpoint",
+            priority=3,
+            requires_checkpoint=True,
+            invasive=True,
+        ),
+        RecoveryPrimitive(
             action_type=RecoveryAction.RETRY_TRANSPORT,
-            domains=(FAULT_DOMAIN_TRANSPORT,),
+            domains=(FAULT_DOMAIN_TELEGRAM_DELIVERY,),
             capability_flag="can_retry_transport",
             priority=1,
             invasive=False,
         ),
         RecoveryPrimitive(
             action_type=RecoveryAction.RESUME_SESSION,
-            domains=(FAULT_DOMAIN_TRANSPORT, FAULT_DOMAIN_SESSION),
+            domains=(FAULT_DOMAIN_SESSION,),
             capability_flag="can_resume_session",
             priority=2,
             requires_checkpoint=True,
@@ -112,7 +158,7 @@ class RecoveryCapabilityRegistry:
         ),
         RecoveryPrimitive(
             action_type=RecoveryAction.NUDGE_AGENT,
-            domains=(FAULT_DOMAIN_TRANSPORT, FAULT_DOMAIN_AGENT),
+            domains=(FAULT_DOMAIN_PROCESS,),
             capability_flag="can_send_task_message",
             priority=3,
             requires_checkpoint=True,
@@ -137,11 +183,16 @@ class RecoveryCapabilityRegistry:
         RecoveryPrimitive(
             action_type=RecoveryAction.VERIFY_RECOVERY,
             domains=(
-                FAULT_DOMAIN_TRANSPORT,
+                FAULT_DOMAIN_MODEL_PROVIDER,
+                FAULT_DOMAIN_TELEGRAM_DELIVERY,
                 FAULT_DOMAIN_CONTEXT,
                 FAULT_DOMAIN_SIDE_EFFECT,
                 FAULT_DOMAIN_SESSION,
-                FAULT_DOMAIN_AGENT,
+                FAULT_DOMAIN_TOOL,
+                FAULT_DOMAIN_PROCESS,
+                FAULT_DOMAIN_GATEWAY,
+                FAULT_DOMAIN_GIT,
+                FAULT_DOMAIN_UNKNOWN,
                 FAULT_DOMAIN_VERIFY,
             ),
             capability_flag=None,
@@ -200,7 +251,7 @@ def build_fault_envelope(task: Any, classification: Any, durable_state: Optional
         recovery_action = RecoveryAction.RECONCILE_SIDE_EFFECT
         requires_checkpoint = True
     elif classification.state == LifecycleState.SUSPECTED_STALL:
-        domain = FAULT_DOMAIN_AGENT
+        domain = FAULT_DOMAIN_PROCESS
         kind = "SUSPECTED_STALL"
         recovery_action = RecoveryAction.NUDGE_AGENT
         requires_checkpoint = True
@@ -210,14 +261,14 @@ def build_fault_envelope(task: Any, classification: Any, durable_state: Optional
             return None
         kind = classification.failure_class
         recovery_action = classification.recovery_action
-        requires_checkpoint = domain != FAULT_DOMAIN_TRANSPORT
+        requires_checkpoint = domain not in CHECKPOINT_OPTIONAL_DOMAINS
     elif classification.recovery_action:
         domain = ACTION_TYPE_TO_DOMAIN.get(classification.recovery_action)
         if not domain:
             return None
         kind = classification.recovery_action
         recovery_action = classification.recovery_action
-        requires_checkpoint = domain != FAULT_DOMAIN_TRANSPORT
+        requires_checkpoint = domain not in CHECKPOINT_OPTIONAL_DOMAINS
     else:
         return None
 
@@ -229,15 +280,24 @@ def build_fault_envelope(task: Any, classification: Any, durable_state: Optional
         "structured_state": getattr(task, "structured_state", ""),
         "session_state": getattr(task, "session_state", ""),
         "reasoning": getattr(classification, "reasoning", ""),
+        "error_event_id": ((getattr(task, "structured_provider_error", None) or {}).get("event_id")),
+        "provider_http_status": ((getattr(task, "structured_provider_error", None) or {}).get("http_status")),
+        "provider_error_occurred_at": (
+            (getattr(task, "structured_provider_error", None) or {}).get("timestamp")
+            or getattr(task, "last_provider_request_at", 0)
+        ),
+        "provider_request_at": getattr(task, "last_provider_request_at", 0),
         "pending_action": durable_state.get("pending_action"),
         "last_completed_action": durable_state.get("last_completed_action"),
         "first_unproven_boundary": durable_state.get("first_unproven_boundary"),
+        "recovery_generation": durable_state.get("generation", 1),
     }
     fault_key = {
         "task_id": getattr(task, "task_id", ""),
         "domain": domain,
         "kind": kind,
         "state": classification.state,
+        "error_event_id": evidence["error_event_id"],
         "invalidators": list(invalidators),
     }
     fault_id = hashlib.sha256(

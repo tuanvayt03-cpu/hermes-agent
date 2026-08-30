@@ -49,6 +49,8 @@ class MockTask:
         self.session_state = kwargs.get('session_state', '')
         self.worker_process_alive = kwargs.get('worker_process_alive', False)
         self.explicit_markers = kwargs.get('explicit_markers', {})
+        self.first_unproven_boundary = kwargs.get('first_unproven_boundary')
+        self.structured_provider_error = kwargs.get('structured_provider_error')
 
 class TestWatchdogStore(unittest.TestCase):
     """Test SQLite persistence layer."""
@@ -304,7 +306,7 @@ class TestLifecycleClassifier(unittest.TestCase):
         result = self.classifier.classify(task)
         self.assertEqual(result.state, LifecycleState.TRANSIENT_FAILURE)
         self.assertEqual(result.failure_class, FailureClass.PROVIDER_OVERLOAD)
-        self.assertEqual(result.recovery_action, "RETRY_TRANSPORT")
+        self.assertEqual(result.recovery_action, RecoveryAction.MODEL_PROVIDER_RETRY)
     
     def test_timeout(self):
         task = MockTask(
@@ -395,7 +397,7 @@ class TestLifecycleClassifier(unittest.TestCase):
         result = self.classifier.classify(task)
         self.assertEqual(result.state, LifecycleState.TRANSIENT_FAILURE)
         self.assertEqual(result.failure_class, FailureClass.NETWORK_TRANSIENT)
-        self.assertEqual(result.recovery_action, "RETRY_TRANSPORT")
+        self.assertEqual(result.recovery_action, RecoveryAction.MODEL_PROVIDER_RETRY)
 
     def test_unknown_error_needs_attention(self):
         """Test unknown provider failure → NEEDS_ATTENTION (fail-closed)"""
@@ -865,42 +867,60 @@ class TestV3DurableWorkflow(unittest.TestCase):
 class TestRecoveryKernel(unittest.TestCase):
     """Focused tests for the generic recovery kernel."""
 
-    def test_fault_envelope_normalizes_transport_failures(self):
+    def test_fault_envelope_normalizes_model_provider_failures(self):
         from core.recovery_kernel import build_fault_envelope
 
-        task = MockTask(provider_request_state="RATE_LIMITED")
+        task = MockTask(
+            provider_request_state="TIMEOUT",
+            last_provider_request_at=100.0,
+            structured_provider_error={
+                "event_id": "prov_evt_504",
+                "http_status": 504,
+                "timestamp": 100.0,
+            },
+        )
         classification = ClassificationResult(
             state=LifecycleState.TRANSIENT_FAILURE,
             confidence=0.9,
-            failure_class=FailureClass.HTTP_429_TEMP,
-            recovery_action=RecoveryAction.RETRY_TRANSPORT,
+            failure_class=FailureClass.NETWORK_TRANSIENT,
+            recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
             evidence={},
-            reasoning="Rate limit",
+            reasoning="504 upstream timeout",
         )
 
-        envelope = build_fault_envelope(task, classification, durable_state={})
+        envelope = build_fault_envelope(
+            task,
+            classification,
+            durable_state={"generation": 7, "first_unproven_boundary": "MODEL_PROVIDER_RECOVERY_PRIMITIVE_EXECUTION"},
+        )
 
         self.assertIsNotNone(envelope)
-        self.assertEqual(envelope.domain, "transport")
-        self.assertEqual(envelope.kind, FailureClass.HTTP_429_TEMP)
+        self.assertEqual(envelope.domain, "model_provider")
+        self.assertEqual(envelope.kind, FailureClass.NETWORK_TRANSIENT)
         self.assertFalse(envelope.requires_checkpoint)
+        self.assertEqual(envelope.evidence["error_event_id"], "prov_evt_504")
+        self.assertEqual(envelope.evidence["provider_http_status"], 504)
+        self.assertEqual(envelope.evidence["recovery_generation"], 7)
 
     def test_capability_registry_returns_domain_primitives(self):
         from core.recovery_kernel import RecoveryCapabilityRegistry
 
         registry = RecoveryCapabilityRegistry({
-            "can_retry_transport": True,
+            "can_retry_model_provider": True,
             "can_resume_session": True,
-            "can_send_task_message": True,
+            "can_switch_model_provider": True,
+            "can_resume_worker_from_checkpoint": True,
         })
 
-        primitives = registry.primitives_for_domain("transport")
+        primitives = registry.primitives_for_domain("model_provider")
         action_types = [primitive.action_type for primitive in primitives]
 
-        self.assertEqual(action_types[:3], [
-            RecoveryAction.RETRY_TRANSPORT,
-            RecoveryAction.RESUME_SESSION,
-            RecoveryAction.NUDGE_AGENT,
+        self.assertEqual(action_types, [
+            RecoveryAction.MODEL_PROVIDER_RETRY,
+            RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT,
+            RecoveryAction.MODEL_PROVIDER_SWITCH,
+            RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT,
+            RecoveryAction.VERIFY_RECOVERY,
         ])
 
     def test_planner_uses_verify_recovery_when_invalidator_present(self):
@@ -908,14 +928,17 @@ class TestRecoveryKernel(unittest.TestCase):
 
         planner = RecoveryPlanner(
             {"recovery_budgets": {FailureClass.NETWORK_TRANSIENT: {"max_retries": 2}}},
-            {"can_retry_transport": True},
+            {"can_retry_model_provider": True},
         )
-        task = MockTask(provider_request_state="TIMEOUT")
+        task = MockTask(
+            provider_request_state="TIMEOUT",
+            structured_provider_error={"event_id": "prov_evt_002", "timestamp": 100.0},
+        )
         classification = ClassificationResult(
             state=LifecycleState.TRANSIENT_FAILURE,
             confidence=0.8,
             failure_class=FailureClass.NETWORK_TRANSIENT,
-            recovery_action=RecoveryAction.RETRY_TRANSPORT,
+            recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
             evidence={},
             reasoning="Timeout",
         )
@@ -932,6 +955,146 @@ class TestRecoveryKernel(unittest.TestCase):
 
         self.assertEqual(len(plans), 1)
         self.assertEqual(plans[0].action_type, RecoveryAction.VERIFY_RECOVERY)
+
+    def test_model_provider_fault_plans_without_transport_recovery(self):
+        from core.recovery_planner import RecoveryPlanner
+
+        planner = RecoveryPlanner(
+            {"recovery_budgets": {FailureClass.NETWORK_TRANSIENT: {"max_retries": 2}}},
+            {
+                "can_retry_transport": True,
+                "can_retry_model_provider": False,
+                "can_resume_session": True,
+                "can_switch_model_provider": False,
+                "can_resume_worker_from_checkpoint": True,
+            },
+        )
+        task = MockTask(
+            provider_request_state="TIMEOUT",
+            structured_provider_error={"event_id": "prov_evt_001"},
+        )
+        classification = ClassificationResult(
+            state=LifecycleState.TRANSIENT_FAILURE,
+            confidence=0.8,
+            failure_class=FailureClass.NETWORK_TRANSIENT,
+            recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
+            evidence={},
+            reasoning="Timeout",
+        )
+
+        plans = planner.plan_recovery(
+            task,
+            classification,
+            store=None,
+            watchdog_id="test_watchdog",
+            durable_state={"generation": 7, "first_unproven_boundary": "MODEL_PROVIDER_RECOVERY_PRIMITIVE_EXECUTION"},
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].action_type, RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT)
+        self.assertEqual(plans[0].fault_envelope["domain"], "model_provider")
+        self.assertNotEqual(plans[0].action_type, RecoveryAction.RETRY_TRANSPORT)
+
+    def test_model_provider_idempotency_key_scopes_task_event_generation_and_action(self):
+        from core.recovery_planner import RecoveryPlanner
+
+        planner = RecoveryPlanner(
+            {"recovery_budgets": {FailureClass.NETWORK_TRANSIENT: {"max_retries": 2}}},
+            {"can_retry_model_provider": True},
+        )
+        task = MockTask(
+            task_id="task_scope",
+            provider_request_state="TIMEOUT",
+            structured_provider_error={"event_id": "prov_evt_scope", "timestamp": 100.0},
+        )
+        classification = ClassificationResult(
+            state=LifecycleState.TRANSIENT_FAILURE,
+            confidence=0.8,
+            failure_class=FailureClass.NETWORK_TRANSIENT,
+            recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
+            evidence={},
+            reasoning="Timeout",
+        )
+
+        plans = planner.plan_recovery(
+            task,
+            classification,
+            store=None,
+            watchdog_id="test_watchdog",
+            durable_state={"generation": 9},
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(
+            plans[0].idempotency_key,
+            "MODEL_PROVIDER_RETRY:task_scope:prov_evt_scope:9",
+        )
+
+
+class TestModelProviderVerification(unittest.TestCase):
+    """Focused verification tests for model-provider recovery evidence."""
+
+    def test_model_provider_verification_does_not_trust_telegram_claims(self):
+        adapter = HermesAdapter({})
+        task = MockTask(
+            task_id="verify_task",
+            provider_request_state="TIMEOUT",
+            last_provider_request_at=100.0,
+            last_agent_event_at=100.0,
+            last_tool_start_at=0,
+            last_tool_end_at=0,
+            structured_provider_error={"event_id": "prov_evt_verify", "timestamp": 100.0},
+        )
+
+        verification = adapter.verify_recovery_effect(
+            RecoveryAction.MODEL_PROVIDER_RETRY,
+            task,
+            {
+                "_fault_envelope": {
+                    "domain": "model_provider",
+                    "evidence": {
+                        "error_event_id": "prov_evt_verify",
+                        "provider_error_occurred_at": 100.0,
+                        "first_unproven_boundary": "B0",
+                    },
+                }
+            },
+            {"success": True, "claimed_count": 99, "details": "telegram claimed"},
+        )
+
+        self.assertFalse(verification["verified"])
+        self.assertEqual(verification["effect_state"], "PENDING")
+        self.assertFalse(verification["evidence"]["later_assistant_activity"])
+        self.assertFalse(verification["evidence"]["has_effect_evidence"])
+
+    def test_model_provider_verification_accepts_boundary_advancement(self):
+        adapter = HermesAdapter({})
+        task = MockTask(
+            task_id="verify_task_boundary",
+            provider_request_state="",
+            last_provider_request_at=100.0,
+            metadata={"first_unproven_boundary": "B1"},
+            structured_provider_error={"event_id": "prov_evt_boundary", "timestamp": 100.0},
+        )
+
+        verification = adapter.verify_recovery_effect(
+            RecoveryAction.VERIFY_RECOVERY,
+            task,
+            {
+                "_fault_envelope": {
+                    "domain": "model_provider",
+                    "evidence": {
+                        "error_event_id": "prov_evt_boundary",
+                        "provider_error_occurred_at": 100.0,
+                        "first_unproven_boundary": "B0",
+                    },
+                }
+            },
+            {"success": True, "details": "verification only"},
+        )
+
+        self.assertTrue(verification["verified"])
+        self.assertTrue(verification["evidence"]["first_unproven_boundary_advanced"])
 
 
 class TestRecoveryExecution(unittest.TestCase):
@@ -974,7 +1137,10 @@ class TestRecoveryExecution(unittest.TestCase):
         watchdog.watchdog_id = "test_watchdog"
         watchdog.capabilities = type("Caps", (), {
             "can_retry_transport": True,
+            "can_retry_model_provider": False,
             "can_resume_session": True,
+            "can_switch_model_provider": False,
+            "can_resume_worker_from_checkpoint": True,
             "can_send_task_message": True,
             "can_compact_context": True,
             "can_reconcile_side_effect": True,
@@ -1219,6 +1385,104 @@ class TestHermesAdapter(unittest.TestCase):
         # Should return empty list without crashing
         tasks = self.adapter.discover_tasks()
         self.assertIsInstance(tasks, list)
+
+    def test_transport_verify_recovery_effect_uses_ledger_claims(self):
+        task = MockTask(
+            task_id="verify_task",
+            session_id="verify_session",
+            session_key="verify_key",
+            last_agent_event_at=90,
+            last_tool_start_at=90,
+            last_tool_end_at=90,
+            last_provider_request_at=90,
+            metadata={"first_unproven_boundary": "MODEL_PROVIDER_RECOVERY_PRIMITIVE_EXECUTION"},
+        )
+        verification = self.adapter.verify_recovery_effect(
+            RecoveryAction.RETRY_TRANSPORT,
+            task,
+            {
+                "_attempted_at": 100,
+                "_first_unproven_boundary": "MODEL_PROVIDER_RECOVERY_PRIMITIVE_EXECUTION",
+                "_fault_envelope": {"domain": "telegram_delivery", "evidence": {"error_event_id": "evt_1"}},
+            },
+            {"success": True, "claimed_count": 4, "details": "claimed", "attempted_at": 100},
+        )
+
+        self.assertTrue(verification["verified"])
+        self.assertEqual(verification["effect_state"], "VERIFIED")
+        self.assertTrue(verification["evidence"]["has_effect_evidence"])
+
+    def test_model_provider_verify_recovery_effect_accepts_boundary_advancement(self):
+        task = MockTask(
+            task_id="verify_task",
+            session_id="verify_session",
+            session_key="verify_key",
+            last_agent_event_at=90,
+            last_tool_start_at=90,
+            last_tool_end_at=90,
+            last_provider_request_at=90,
+            metadata={"first_unproven_boundary": "POST_MODEL_PROVIDER_BOUNDARY"},
+        )
+        verification = self.adapter.verify_recovery_effect(
+            RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT,
+            task,
+            {
+                "_fault_envelope": {
+                    "domain": "model_provider",
+                    "evidence": {
+                        "error_event_id": "evt_2",
+                        "provider_error_occurred_at": 80,
+                        "first_unproven_boundary": "MODEL_PROVIDER_RECOVERY_PRIMITIVE_EXECUTION",
+                    },
+                },
+            },
+            {"success": True, "details": "resume marked", "attempted_at": 100},
+        )
+
+        self.assertTrue(verification["verified"])
+        self.assertTrue(verification["evidence"]["first_unproven_boundary_advanced"])
+
+    def test_model_provider_idempotency_key_includes_scoped_fields(self):
+        from core.recovery_planner import RecoveryPlanner
+
+        planner = RecoveryPlanner(
+            {"recovery_budgets": {FailureClass.NETWORK_TRANSIENT: {"max_retries": 2}}},
+            {
+                "can_retry_model_provider": False,
+                "can_resume_session": True,
+                "can_switch_model_provider": False,
+                "can_resume_worker_from_checkpoint": False,
+            },
+        )
+        task = MockTask(
+            task_id="scope_task",
+            session_id="scope_session",
+            session_key="scope_key",
+            provider_request_state="TIMEOUT",
+            structured_provider_error={"event_id": "prov_evt_scope_42"},
+        )
+        classification = ClassificationResult(
+            state=LifecycleState.TRANSIENT_FAILURE,
+            confidence=0.8,
+            failure_class=FailureClass.NETWORK_TRANSIENT,
+            recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
+            evidence={},
+            reasoning="Timeout",
+        )
+
+        plans = planner.plan_recovery(
+            task,
+            classification,
+            store=None,
+            watchdog_id="test_watchdog",
+            durable_state={"generation": 11},
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(
+            plans[0].idempotency_key,
+            "SESSION_RESUME_FROM_CHECKPOINT:scope_task:prov_evt_scope_42:11",
+        )
 
 class TestIntegration(unittest.TestCase):
     """Integration tests for full workflow."""

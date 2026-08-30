@@ -40,6 +40,10 @@ class FailureClass:
 
 # Recovery action types
 class RecoveryAction:
+    MODEL_PROVIDER_RETRY = "MODEL_PROVIDER_RETRY"
+    SESSION_RESUME_FROM_CHECKPOINT = "SESSION_RESUME_FROM_CHECKPOINT"
+    MODEL_PROVIDER_SWITCH = "MODEL_PROVIDER_SWITCH"
+    WORKER_RESUME_FROM_CHECKPOINT = "WORKER_RESUME_FROM_CHECKPOINT"
     RETRY_TRANSPORT = "RETRY_TRANSPORT"
     RESUME_SESSION = "RESUME_SESSION"
     NUDGE_AGENT = "NUDGE_AGENT"
@@ -239,9 +243,9 @@ class LifecycleClassifier:
                 state=LifecycleState.TRANSIENT_FAILURE,
                 confidence=0.85,
                 failure_class=FailureClass.PROVIDER_OVERLOAD,
-                recovery_action=RecoveryAction.RETRY_TRANSPORT,
+                recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
                 evidence=evidence,
-                reasoning="Provider overload detected"
+                reasoning="Provider overload detected - route to model-provider recovery ladder"
             )
 
         if provider_state == "TIMEOUT":
@@ -249,9 +253,9 @@ class LifecycleClassifier:
                 state=LifecycleState.TRANSIENT_FAILURE,
                 confidence=0.8,
                 failure_class=FailureClass.NETWORK_TRANSIENT,
-                recovery_action=RecoveryAction.RETRY_TRANSPORT,
+                recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
                 evidence=evidence,
-                reasoning="Request timeout detected"
+                reasoning="Provider request timeout detected - route to model-provider recovery ladder"
             )
 
         if provider_state == "RATE_LIMITED":
@@ -259,20 +263,20 @@ class LifecycleClassifier:
                 state=LifecycleState.TRANSIENT_FAILURE,
                 confidence=0.85,
                 failure_class=FailureClass.HTTP_429_TEMP,
-                recovery_action=RecoveryAction.RETRY_TRANSPORT,
+                recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
                 evidence=evidence,
-                reasoning="Rate limit (429) detected"
+                reasoning="Provider rate limit (429) detected - route to model-provider recovery ladder"
             )
 
-        # Network transient (DNS, connection errors) - retryable
+        # Provider-side network transient (DNS, connection errors) - retryable
         if provider_state == "NETWORK_TRANSIENT":
             return ClassificationResult(
                 state=LifecycleState.TRANSIENT_FAILURE,
                 confidence=0.8,
                 failure_class=FailureClass.NETWORK_TRANSIENT,
-                recovery_action=RecoveryAction.RETRY_TRANSPORT,
+                recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
                 evidence=evidence,
-                reasoning="Network/DNS transient error detected"
+                reasoning="Provider network/DNS transient detected - route to model-provider recovery ladder"
             )
 
         # Context window exceeded - NOT a transient failure, requires compaction
@@ -295,9 +299,9 @@ class LifecycleClassifier:
                         state=LifecycleState.TRANSIENT_FAILURE,
                         confidence=0.75,
                         failure_class=error_class,
-                        recovery_action=RecoveryAction.RETRY_TRANSPORT,
+                        recovery_action=RecoveryAction.MODEL_PROVIDER_RETRY,
                         evidence=evidence,
-                        reasoning=f"Error classified as {error_class}"
+                        reasoning=f"Error classified as {error_class} - route to model-provider recovery ladder"
                     )
 
         return None

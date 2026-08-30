@@ -52,8 +52,12 @@ class RecoveryPlanner:
             RecoveryAction.COMPACT_CONTEXT: 0,  # Highest priority for context overflow
             RecoveryAction.RECONCILE_SIDE_EFFECT: 0,  # Same priority - critical
             RecoveryAction.RETRY_TRANSPORT: 1,
+            RecoveryAction.MODEL_PROVIDER_RETRY: 1,
             RecoveryAction.RESUME_SESSION: 2,
+            RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT: 2,
+            RecoveryAction.MODEL_PROVIDER_SWITCH: 3,
             RecoveryAction.NUDGE_AGENT: 3,
+            RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT: 4,
             RecoveryAction.VERIFY_RECOVERY: 10,
             RecoveryAction.NO_ACTION: 99,
         }
@@ -66,6 +70,7 @@ class RecoveryPlanner:
         """Generate recovery plans for a classified task."""
         plans = []
         self._store = store
+        self._durable_state = durable_state or {}
         fault = build_fault_envelope(
             task,
             classification,
@@ -150,6 +155,9 @@ class RecoveryPlanner:
                         watchdog_id: str, fault,
                         primary_only: bool = False) -> List[RecoveryPlan]:
         """Plan recovery generically from a normalized fault envelope."""
+        if fault.domain == "model_provider":
+            return self._plan_model_provider_fault(task, classification, watchdog_id, fault)
+
         plans = []
         fc = classification.failure_class
 
@@ -167,18 +175,35 @@ class RecoveryPlanner:
             plan = self._create_plan_for_primitive(primitive.action_type, task, classification, watchdog_id, fault)
             if plan:
                 plans.append(plan)
-                if primary_only:
-                    break
-            if primary_only:
-                break
-            if plans and primitive.action_type == RecoveryAction.RETRY_TRANSPORT:
                 break
 
         return plans
 
+    def _plan_model_provider_fault(self, task: 'DiscoveredTask',
+                                   classification: ClassificationResult,
+                                   watchdog_id: str, fault) -> List[RecoveryPlan]:
+        """Plan only the first proven model-provider primitive in ladder order."""
+        for primitive in self.registry.primitives_for_domain(fault.domain):
+            if primitive.action_type == RecoveryAction.VERIFY_RECOVERY:
+                continue
+            plan = self._create_plan_for_primitive(
+                primitive.action_type, task, classification, watchdog_id, fault
+            )
+            if plan:
+                return [plan]
+        return []
+
     def _create_plan_for_primitive(self, action_type: str, task: 'DiscoveredTask',
                                    classification: ClassificationResult,
                                    watchdog_id: str, fault) -> Optional[RecoveryPlan]:
+        if action_type == RecoveryAction.MODEL_PROVIDER_RETRY:
+            return self._create_model_provider_retry_plan(task, classification, watchdog_id, fault)
+        if action_type == RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT:
+            return self._create_session_resume_from_checkpoint_plan(task, classification, watchdog_id, fault)
+        if action_type == RecoveryAction.MODEL_PROVIDER_SWITCH:
+            return self._create_model_provider_switch_plan(task, classification, watchdog_id, fault)
+        if action_type == RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT:
+            return self._create_worker_resume_from_checkpoint_plan(task, classification, watchdog_id, fault)
         if action_type == RecoveryAction.RETRY_TRANSPORT:
             return self._create_transport_retry_plan(task, classification, watchdog_id, fault)
         if action_type == RecoveryAction.RESUME_SESSION:
@@ -193,18 +218,173 @@ class RecoveryPlanner:
             return self._create_verify_recovery_plan(task, classification, fault, watchdog_id)
         return None
 
+    def _build_idempotency_key(self, task: 'DiscoveredTask', action_type: str, fault) -> str:
+        evidence = (fault or {}).evidence if hasattr(fault, "evidence") else (fault or {}).get("evidence", {})
+        error_event_id = evidence.get("error_event_id") or "NO_ERROR_EVENT"
+        recovery_generation = evidence.get("recovery_generation", self._durable_state.get("generation", 1))
+        return f"{action_type}:{task.task_id}:{error_event_id}:{recovery_generation}"
+
+    def _seen_idempotency_key(self, idempotency_key: str) -> bool:
+        store = getattr(self, '_store', None)
+        return bool(store and store.has_action_idempotency_key(idempotency_key))
+
+    def _fault_scope_params(self, fault) -> Dict:
+        evidence = (fault or {}).evidence if hasattr(fault, "evidence") else (fault or {}).get("evidence", {})
+        return {
+            "fault_id": getattr(fault, "fault_id", "") if hasattr(fault, "fault_id") else (fault or {}).get("fault_id", ""),
+            "error_event_id": evidence.get("error_event_id"),
+            "recovery_generation": evidence.get("recovery_generation", self._durable_state.get("generation", 1)),
+        }
+
+    def _configured_model_provider_switch(self) -> Optional[Dict]:
+        nested = (self.config.get("model_provider_recovery") or {}).get("switch")
+        direct = self.config.get("model_provider_switch")
+        configured = nested if nested is not None else direct
+        if not configured:
+            return None
+        if isinstance(configured, str):
+            return {"provider": configured}
+        if not isinstance(configured, dict):
+            return None
+        if configured.get("enabled") is False:
+            return None
+        if any(configured.get(field) for field in ("provider", "target_provider", "model", "raw_input")):
+            return dict(configured)
+        return None
+
+    def _create_model_provider_retry_plan(self, task: 'DiscoveredTask',
+                                          classification: ClassificationResult,
+                                          watchdog_id: str, fault) -> Optional[RecoveryPlan]:
+        """Create a direct model-provider retry plan when a real API exists."""
+        action_id = f"model_provider_retry_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.MODEL_PROVIDER_RETRY, fault)
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug("Model provider retry already executed for %s", task.task_id)
+            return None
+
+        return RecoveryPlan(
+            action_id=action_id,
+            task_id=task.task_id,
+            action_type=RecoveryAction.MODEL_PROVIDER_RETRY,
+            failure_class=classification.failure_class,
+            priority=self.action_priority[RecoveryAction.MODEL_PROVIDER_RETRY],
+            params={
+                "session_key": task.session_key,
+                "session_id": task.session_id,
+                **self._fault_scope_params(fault),
+            },
+            idempotency_key=idempotency_key,
+            scheduled_at=time.time(),
+            lease_required=True,
+            reasoning=f"Direct model-provider retry for {fault.kind}",
+            fault_envelope=fault.to_dict(),
+        )
+
+    def _create_session_resume_from_checkpoint_plan(self, task: 'DiscoveredTask',
+                                                    classification: ClassificationResult,
+                                                    watchdog_id: str, fault) -> Optional[RecoveryPlan]:
+        """Create a checkpoint-based session resume plan for model-provider faults."""
+        action_id = f"session_resume_checkpoint_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        idempotency_key = self._build_idempotency_key(
+            task, RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT, fault
+        )
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug("Session resume-from-checkpoint already executed for %s", task.task_id)
+            return None
+
+        return RecoveryPlan(
+            action_id=action_id,
+            task_id=task.task_id,
+            action_type=RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT,
+            failure_class=classification.failure_class,
+            priority=self.action_priority[RecoveryAction.SESSION_RESUME_FROM_CHECKPOINT],
+            params={
+                "session_key": task.session_key,
+                "session_id": task.session_id,
+                "resume_reason": f"model_provider_fault:{fault.kind}",
+                **self._fault_scope_params(fault),
+            },
+            idempotency_key=idempotency_key,
+            scheduled_at=time.time(),
+            lease_required=True,
+            reasoning=f"Resume same session from checkpoint for {fault.kind}",
+            fault_envelope=fault.to_dict(),
+        )
+
+    def _create_model_provider_switch_plan(self, task: 'DiscoveredTask',
+                                           classification: ClassificationResult,
+                                           watchdog_id: str, fault) -> Optional[RecoveryPlan]:
+        """Create a configured fallback-provider switch plan."""
+        switch_config = self._configured_model_provider_switch()
+        if not switch_config:
+            return None
+
+        action_id = f"model_provider_switch_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.MODEL_PROVIDER_SWITCH, fault)
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug("Model provider switch already executed for %s", task.task_id)
+            return None
+
+        return RecoveryPlan(
+            action_id=action_id,
+            task_id=task.task_id,
+            action_type=RecoveryAction.MODEL_PROVIDER_SWITCH,
+            failure_class=classification.failure_class,
+            priority=self.action_priority[RecoveryAction.MODEL_PROVIDER_SWITCH],
+            params={
+                "session_key": task.session_key,
+                "session_id": task.session_id,
+                **self._fault_scope_params(fault),
+                **switch_config,
+            },
+            idempotency_key=idempotency_key,
+            scheduled_at=time.time(),
+            lease_required=True,
+            reasoning=f"Switch to configured fallback provider for {fault.kind}",
+            fault_envelope=fault.to_dict(),
+        )
+
+    def _create_worker_resume_from_checkpoint_plan(self, task: 'DiscoveredTask',
+                                                   classification: ClassificationResult,
+                                                   watchdog_id: str, fault) -> Optional[RecoveryPlan]:
+        """Create a process-registry recovery plan as final model-provider fallback."""
+        action_id = f"worker_resume_checkpoint_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        idempotency_key = self._build_idempotency_key(
+            task, RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT, fault
+        )
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug("Worker resume-from-checkpoint already executed for %s", task.task_id)
+            return None
+
+        return RecoveryPlan(
+            action_id=action_id,
+            task_id=task.task_id,
+            action_type=RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT,
+            failure_class=classification.failure_class,
+            priority=self.action_priority[RecoveryAction.WORKER_RESUME_FROM_CHECKPOINT],
+            params={
+                "session_key": task.session_key,
+                "session_id": task.session_id,
+                **self._fault_scope_params(fault),
+            },
+            idempotency_key=idempotency_key,
+            scheduled_at=time.time(),
+            lease_required=True,
+            reasoning=f"Recover worker/process checkpoint for {fault.kind}",
+            fault_envelope=fault.to_dict(),
+        )
+
     def _create_transport_retry_plan(self, task: 'DiscoveredTask',
                                       classification: ClassificationResult,
                                       watchdog_id: str, fault) -> Optional[RecoveryPlan]:
         """Create a transport retry plan."""
         action_id = f"retry_transport_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"transport_retry:{task.task_id}:{fault.kind}"
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.RETRY_TRANSPORT, fault)
 
         # Check if we've already executed this action recently
-        if store := getattr(self, '_store', None):
-            if store.has_action_idempotency_key(idempotency_key):
-                logger.debug(f"Transport retry already executed for {task.task_id}")
-                return None
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug(f"Transport retry already executed for {task.task_id}")
+            return None
 
         return RecoveryPlan(
             action_id=action_id,
@@ -212,7 +392,11 @@ class RecoveryPlanner:
             action_type=RecoveryAction.RETRY_TRANSPORT,
             failure_class=classification.failure_class,
             priority=self.action_priority[RecoveryAction.RETRY_TRANSPORT],
-            params={"platform": task.platform, "session_key": task.session_key},
+            params={
+                "platform": task.platform,
+                "session_key": task.session_key,
+                **self._fault_scope_params(fault),
+            },
             idempotency_key=idempotency_key,
             scheduled_at=time.time(),
             lease_required=True,
@@ -225,7 +409,10 @@ class RecoveryPlanner:
                              watchdog_id: str, fault) -> Optional[RecoveryPlan]:
         """Create a session resume plan."""
         action_id = f"resume_session_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"resume_session:{task.task_id}:{task.session_key}"
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.RESUME_SESSION, fault)
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug("Session recovery already executed for %s", task.task_id)
+            return None
 
         return RecoveryPlan(
             action_id=action_id,
@@ -233,7 +420,11 @@ class RecoveryPlanner:
             action_type=RecoveryAction.RESUME_SESSION,
             failure_class=classification.failure_class,
             priority=self.action_priority[RecoveryAction.RESUME_SESSION],
-            params={"session_key": task.session_key, "session_id": task.session_id},
+            params={
+                "session_key": task.session_key,
+                "session_id": task.session_id,
+                **self._fault_scope_params(fault),
+            },
             idempotency_key=idempotency_key,
             scheduled_at=time.time(),
             lease_required=True,
@@ -246,21 +437,20 @@ class RecoveryPlanner:
                             watchdog_id: str, fault) -> Optional[RecoveryPlan]:
         """Create an agent nudge plan."""
         action_id = f"nudge_agent_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"nudge_agent:{task.task_id}:{int(time.time() // 3600)}"  # Hourly bucket
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.NUDGE_AGENT, fault)
 
         # Nudge is invasive - only if truly needed
         if classification.state != LifecycleState.SUSPECTED_STALL:
             if classification.state != LifecycleState.TRANSIENT_FAILURE:
                 return None
             # For transient failure, only nudge if no other recovery available
-            if self._has_safer_recovery(classification):
+            if self._has_safer_recovery(fault):
                 return None
 
         # Check if we already nudged recently
-        if store := getattr(self, '_store', None):
-            if store.has_action_idempotency_key(idempotency_key):
-                logger.debug(f"Nudge already sent for {task.task_id} this hour")
-                return None
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug(f"Nudge already sent for {task.task_id} in current recovery scope")
+            return None
 
         return RecoveryPlan(
             action_id=action_id,
@@ -271,7 +461,8 @@ class RecoveryPlanner:
             params={
                 "session_key": task.session_key,
                 "session_id": task.session_id,
-                "message": "Continue from the last verified state. Re-read current state before acting. Do not redo completed work. Do not repeat any action whose side-effect outcome is uncertain."
+                "message": "Continue from the last verified state. Re-read current state before acting. Do not redo completed work. Do not repeat any action whose side-effect outcome is uncertain.",
+                **self._fault_scope_params(fault),
             },
             idempotency_key=idempotency_key,
             scheduled_at=time.time(),
@@ -285,13 +476,12 @@ class RecoveryPlanner:
                              watchdog_id: str, fault) -> Optional[RecoveryPlan]:
         """Create a context compaction plan."""
         action_id = f"compact_context_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"compact_context:{task.task_id}:{fault.kind}"
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.COMPACT_CONTEXT, fault)
 
         # Check if we've already executed this action
-        if store := getattr(self, '_store', None):
-            if store.has_action_idempotency_key(idempotency_key):
-                logger.debug(f"Context compaction already executed for {task.task_id}")
-                return None
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug(f"Context compaction already executed for {task.task_id}")
+            return None
 
         return RecoveryPlan(
             action_id=action_id,
@@ -302,7 +492,8 @@ class RecoveryPlanner:
             params={
                 "session_key": task.session_key,
                 "session_id": task.session_id,
-                "checkpoint_generation": 1,
+                "checkpoint_generation": (fault.evidence or {}).get("recovery_generation", 1),
+                **self._fault_scope_params(fault),
             },
             idempotency_key=idempotency_key,
             scheduled_at=time.time(),
@@ -316,13 +507,12 @@ class RecoveryPlanner:
                                             watchdog_id: str, fault) -> Optional[RecoveryPlan]:
         """Create a side effect reconciliation plan."""
         action_id = f"reconcile_side_effect_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"reconcile_side_effect:{task.task_id}:{task.session_key}"
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.RECONCILE_SIDE_EFFECT, fault)
 
         # Check if we've already executed this action
-        if store := getattr(self, '_store', None):
-            if store.has_action_idempotency_key(idempotency_key):
-                logger.debug(f"Side effect reconciliation already executed for {task.task_id}")
-                return None
+        if self._seen_idempotency_key(idempotency_key):
+            logger.debug(f"Side effect reconciliation already executed for {task.task_id}")
+            return None
 
         return RecoveryPlan(
             action_id=action_id,
@@ -335,6 +525,7 @@ class RecoveryPlanner:
                 "session_id": task.session_id,
                 "pending_action": getattr(task, '_v3_pending_action', None),
                 "last_completed_action": getattr(task, '_v3_last_completed_action', None),
+                **self._fault_scope_params(fault),
             },
             idempotency_key=idempotency_key,
             scheduled_at=time.time(),
@@ -346,6 +537,9 @@ class RecoveryPlanner:
     def _plan_followup(self, task: 'DiscoveredTask', classification: ClassificationResult,
                         store: 'WatchdogStore', watchdog_id: str, fault=None) -> List[RecoveryPlan]:
         """Plan follow-up for tasks in RECOVERY_PENDING/RECOVERING state."""
+        if not store:
+            return []
+
         # Check recent recovery attempts
         attempts = store.get_pending_recovery_attempts(task.task_id)
 
@@ -359,11 +553,19 @@ class RecoveryPlanner:
                     plan = RecoveryPlan(
                         action_id=f"verify_{attempt['action_id']}",
                         task_id=task.task_id,
-                        action_type="VERIFY_RECOVERY",
+                        action_type=RecoveryAction.VERIFY_RECOVERY,
                         failure_class=attempt.get('error_fingerprint_hash'),
                         priority=10,
-                        params={"original_action_id": attempt['action_id']},
-                        idempotency_key=f"verify:{attempt['action_id']}",
+                        params={
+                            "original_action_id": attempt['action_id'],
+                            "fault_id": fault.fault_id if fault else None,
+                            **(self._fault_scope_params(fault) if fault else {}),
+                        },
+                        idempotency_key=self._build_idempotency_key(
+                            task,
+                            RecoveryAction.VERIFY_RECOVERY,
+                            fault or {"evidence": {"error_event_id": attempt["action_id"], "recovery_generation": 1}},
+                        ),
                         scheduled_at=time.time(),
                         lease_required=False,
                         reasoning="Verify recovery effect after timeout",
@@ -378,14 +580,18 @@ class RecoveryPlanner:
                                      watchdog_id: str) -> Optional[RecoveryPlan]:
         """Create a read-only verification plan."""
         action_id = f"verify_recovery_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"verify_recovery:{task.task_id}:{fault.fault_id}"
+        idempotency_key = self._build_idempotency_key(task, RecoveryAction.VERIFY_RECOVERY, fault)
         return RecoveryPlan(
             action_id=action_id,
             task_id=task.task_id,
             action_type=RecoveryAction.VERIFY_RECOVERY,
             failure_class=classification.failure_class,
             priority=self.action_priority[RecoveryAction.VERIFY_RECOVERY],
-            params={"fault_id": fault.fault_id, "invalidators": list(fault.invalidators)},
+            params={
+                "fault_id": fault.fault_id,
+                "invalidators": list(fault.invalidators),
+                **self._fault_scope_params(fault),
+            },
             idempotency_key=idempotency_key,
             scheduled_at=time.time(),
             lease_required=False,

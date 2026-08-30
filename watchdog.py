@@ -88,8 +88,11 @@ class HermesWatchdog:
         self.planner = RecoveryPlanner(
             self.config["watchdog"],
             {
+                "can_retry_model_provider": self.capabilities.can_retry_model_provider,
                 "can_retry_transport": self.capabilities.can_retry_transport,
                 "can_resume_session": self.capabilities.can_resume_session,
+                "can_switch_model_provider": self.capabilities.can_switch_model_provider,
+                "can_resume_worker_from_checkpoint": self.capabilities.can_resume_worker_from_checkpoint,
                 "can_send_task_message": self.capabilities.can_send_task_message,
                 "can_compact_context": self.capabilities.can_compact_context,
                 "can_reconcile_side_effect": self.capabilities.can_reconcile_side_effect,
@@ -313,11 +316,14 @@ class HermesWatchdog:
                 if fault_domain == "context":
                     if plan.action_type != "COMPACT_CONTEXT" and self.capabilities.can_compact_context:
                         return False
-                # Only transport recovery and read-only verification are allowed in canary.
-                elif fault_domain not in ("transport", "verify"):
+                # Only provider/delivery recovery and read-only verification are allowed in canary.
+                elif fault_domain not in ("model_provider", "telegram_delivery", "verify"):
                     return False
-                # Prefer the lowest-risk transport primitive.
-                elif fault_domain == "transport" and plan.action_type not in ("RETRY_TRANSPORT", "VERIFY_RECOVERY") and self.capabilities.can_retry_transport:
+                # Prefer the lowest-risk model-provider primitive.
+                elif fault_domain == "model_provider" and plan.action_type not in ("MODEL_PROVIDER_RETRY", "VERIFY_RECOVERY") and self.capabilities.can_retry_model_provider:
+                    return False
+                # Prefer the lowest-risk delivery primitive.
+                elif fault_domain == "telegram_delivery" and plan.action_type not in ("RETRY_TRANSPORT", "VERIFY_RECOVERY") and self.capabilities.can_retry_transport:
                     return False
             elif self.mode == "ACTIVE_GLOBAL":
                 # In global mode context recovery still requires the compaction primitive.
@@ -375,8 +381,10 @@ class HermesWatchdog:
 
             checkpoint_hash = self._ensure_recovery_checkpoint(task, plan, durable_state)
             execution_params = dict(plan.params)
+            execution_params["_attempted_at"] = time.time()
             execution_params["_fault_envelope"] = plan.fault_envelope or {}
             execution_params["_checkpoint_hash"] = checkpoint_hash
+            execution_params["_first_unproven_boundary"] = durable_state.get("first_unproven_boundary")
 
             # Execute via adapter
             result = self.adapter.execute_recovery(plan.action_type, task, execution_params)

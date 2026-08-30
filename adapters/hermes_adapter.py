@@ -27,6 +27,9 @@ class HermesCapabilities:
     can_discover_tasks: bool = False
     can_read_structured_status: bool = False
     can_read_events: bool = False
+    can_retry_model_provider: bool = False
+    can_switch_model_provider: bool = False
+    can_resume_worker_from_checkpoint: bool = False
     can_retry_transport: bool = False
     can_resume_session: bool = False
     can_send_task_message: bool = False
@@ -163,7 +166,11 @@ class HermesAdapter:
         except Exception as e:
             errors.append(f"can_retry_transport: {e}")
 
-        # 5. Can resume session (via SessionStore.mark_resume_pending)
+        # 5. Direct model-provider retry API does not currently exist in Hermes.
+        self.capabilities.can_retry_model_provider = False
+        logger.info("Capability: can_retry_model_provider = False (no direct retry API discovered)")
+
+        # 6. Can resume session (via SessionStore.mark_resume_pending)
         try:
             import gateway.session
             # Check if SessionStore has mark_resume_pending
@@ -173,7 +180,20 @@ class HermesAdapter:
         except Exception as e:
             errors.append(f"can_resume_session: {e}")
 
-        # 6. Can send task message (via gateway platform adapters)
+        # 7. No direct live-session provider-switch primitive is exposed to watchdog.
+        self.capabilities.can_switch_model_provider = False
+        logger.info("Capability: can_switch_model_provider = False (no direct provider-switch primitive discovered)")
+
+        # 8. Can resume worker/process checkpoint on startup recovery.
+        try:
+            from tools.process_registry import process_registry
+            if hasattr(process_registry, 'recover_from_checkpoint'):
+                self.capabilities.can_resume_worker_from_checkpoint = True
+                logger.info("Capability: can_resume_worker_from_checkpoint = True")
+        except Exception as e:
+            errors.append(f"can_resume_worker_from_checkpoint: {e}")
+
+        # 9. Can send task message (via gateway platform adapters)
         try:
             import gateway.platforms.base
             # Check if there's a send capability
@@ -182,12 +202,12 @@ class HermesAdapter:
         except Exception as e:
             errors.append(f"can_send_task_message: {e}")
 
-        # 7. Can read quota state (via provider error patterns in messages)
+        # 10. Can read quota state (via provider error patterns in messages)
         # This is inferred from message content analysis
         self.capabilities.can_read_quota_state = True
         logger.info("Capability: can_read_quota_state = True (via message analysis)")
 
-        # 8. Can compact context (via gateway session context compression)
+        # 11. Can compact context (via gateway session context compression)
         try:
             import gateway.session
             # Check if SessionStore has compact_context capability
@@ -197,7 +217,7 @@ class HermesAdapter:
         except Exception as e:
             errors.append(f"can_compact_context: {e}")
 
-        # 9. Can reconcile side effect (via gateway session)
+        # 12. Can reconcile side effect (via gateway session)
         try:
             import gateway.session
             # Check if SessionStore has reconcile_side_effect capability
@@ -598,11 +618,15 @@ class HermesAdapter:
 
     def execute_recovery(self, action_type: str, task: DiscoveredTask, params: Dict) -> Dict:
         """Execute a recovery action. Returns result dict."""
-        result = {"success": False, "action": action_type, "details": ""}
+        result = {"success": False, "action": action_type, "details": "", "attempted_at": time.time()}
         result["fault_domain"] = (params.get("_fault_envelope") or {}).get("domain")
         result["checkpoint_hash"] = params.get("_checkpoint_hash")
+        result["error_event_id"] = (params.get("_fault_envelope") or {}).get("evidence", {}).get("error_event_id")
 
-        if action_type == "RETRY_TRANSPORT":
+        if action_type == "MODEL_PROVIDER_RETRY":
+            result["details"] = "No direct Hermes model-provider retry API is available; skipped without side effects"
+
+        elif action_type == "RETRY_TRANSPORT":
             # Use delivery_ledger sweep_recoverable
             if self.capabilities.can_retry_transport and self._delivery_ledger:
                 try:
@@ -615,14 +639,48 @@ class HermesAdapter:
                 except Exception as e:
                     result["details"] = f"Transport retry failed: {e}"
 
+        elif action_type == "SESSION_RESUME_FROM_CHECKPOINT":
+            if self.capabilities.can_resume_session and task.session_key:
+                try:
+                    result["success"] = self._mark_session_resume_pending(
+                        task.session_key,
+                        reason="model_provider_failure",
+                    )
+                    result["details"] = (
+                        "Marked session resume pending from checkpoint"
+                        if result["success"]
+                        else "Session resume marker was not written"
+                    )
+                except Exception as e:
+                    result["details"] = f"Session checkpoint resume failed: {e}"
+
+        elif action_type == "MODEL_PROVIDER_SWITCH":
+            result["details"] = "No direct Hermes model-provider switch primitive is available for watchdog execution"
+
+        elif action_type == "WORKER_RESUME_FROM_CHECKPOINT":
+            if self.capabilities.can_resume_worker_from_checkpoint:
+                try:
+                    from tools.process_registry import process_registry
+                    recovered = int(process_registry.recover_from_checkpoint() or 0)
+                    result["recovered_count"] = recovered
+                    result["success"] = recovered > 0
+                    result["details"] = f"Recovered {recovered} worker checkpoint entries"
+                except Exception as e:
+                    result["details"] = f"Worker checkpoint recovery failed: {e}"
+
         elif action_type == "RESUME_SESSION":
             # Use SessionStore.mark_resume_pending
             if self.capabilities.can_resume_session and task.session_key:
                 try:
-                    import gateway.session
-                    # Need to get SessionStore instance - this is tricky from outside
-                    # For now, mark as not directly executable without gateway context
-                    result["details"] = "Session resume requires gateway context"
+                    result["success"] = self._mark_session_resume_pending(
+                        task.session_key,
+                        reason="watchdog_resume",
+                    )
+                    result["details"] = (
+                        "Marked session resume pending"
+                        if result["success"]
+                        else "Session resume marker was not written"
+                    )
                 except Exception as e:
                     result["details"] = f"Session resume failed: {e}"
 
@@ -666,6 +724,7 @@ class HermesAdapter:
             "fault_domain": fault.get("domain"),
             "checkpoint_hash": params.get("_checkpoint_hash"),
             "provider_request_state": getattr(task, "provider_request_state", ""),
+            "error_event_id": fault.get("evidence", {}).get("error_event_id"),
         }
         verification = {
             "verified": False,
@@ -675,24 +734,27 @@ class HermesAdapter:
         }
         result = result or {}
 
+        if self._is_model_provider_recovery(action_type, fault.get("domain")):
+            activity_evidence = self._collect_model_provider_effect_evidence(task, fault)
+            evidence.update(activity_evidence)
+            verification["verified"] = activity_evidence["has_effect_evidence"]
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "PENDING"
+            verification["details"] = activity_evidence["details"]
+            return verification
+
+        activity_evidence = self._collect_recovery_effect_evidence(task, params, result)
+        evidence.update(activity_evidence)
+
         if action_type == "RETRY_TRANSPORT":
-            claimed_count = int(result.get("claimed_count", 0) or 0)
-            verification["verified"] = bool(result.get("success")) and claimed_count > 0
-            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
-            verification["details"] = result.get("details", "")
-        elif action_type == "COMPACT_CONTEXT":
-            verification["verified"] = bool(result.get("success"))
-            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
-            verification["details"] = result.get("details", "")
-        elif action_type == "RECONCILE_SIDE_EFFECT":
-            verification["verified"] = bool(result.get("success"))
-            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
-            verification["details"] = result.get("details", "")
-        elif action_type == "RESUME_SESSION":
-            verification["verified"] = bool(result.get("success"))
-            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
-            verification["details"] = result.get("details", "")
-        elif action_type == "NUDGE_AGENT":
+            verification["verified"] = activity_evidence["has_effect_evidence"]
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "PENDING"
+            verification["details"] = activity_evidence["details"] or result.get("details", "")
+        elif action_type in (
+            "COMPACT_CONTEXT",
+            "RECONCILE_SIDE_EFFECT",
+            "RESUME_SESSION",
+            "NUDGE_AGENT",
+        ):
             verification["verified"] = bool(result.get("success"))
             verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
             verification["details"] = result.get("details", "")
@@ -708,6 +770,120 @@ class HermesAdapter:
             )
 
         return verification
+
+    def _is_model_provider_recovery(self, action_type: str, fault_domain: Optional[str]) -> bool:
+        return fault_domain == "model_provider" or action_type in (
+            "MODEL_PROVIDER_RETRY",
+            "SESSION_RESUME_FROM_CHECKPOINT",
+            "MODEL_PROVIDER_SWITCH",
+            "WORKER_RESUME_FROM_CHECKPOINT",
+        )
+
+    def _mark_session_resume_pending(self, session_key: str, reason: str) -> bool:
+        """Mark an existing Hermes session resumable using the runtime SessionStore."""
+        import gateway.config
+        import gateway.session
+
+        if self._sessions_dir is None:
+            self._resolve_paths()
+
+        config = gateway.config.GatewayConfig(sessions_dir=self._sessions_dir)
+        store = gateway.session.SessionStore(self._sessions_dir, config)
+        return bool(store.mark_resume_pending(session_key, reason=reason))
+
+    def _current_first_unproven_boundary(self, task: DiscoveredTask) -> Optional[str]:
+        metadata = getattr(task, "metadata", {}) or {}
+        markers = getattr(task, "explicit_markers", {}) or {}
+        return (
+            getattr(task, "first_unproven_boundary", None)
+            or metadata.get("first_unproven_boundary")
+            or markers.get("first_unproven_boundary")
+            or markers.get("resume_boundary")
+        )
+
+    def _collect_model_provider_effect_evidence(self, task: DiscoveredTask, fault: Dict) -> Dict:
+        """Verify model-provider recovery from later runtime activity or boundary advancement."""
+        fault_evidence = fault.get("evidence", {}) or {}
+        fault_at = float(
+            fault_evidence.get("provider_error_occurred_at")
+            or fault_evidence.get("provider_request_at")
+            or 0
+        )
+        previous_boundary = fault_evidence.get("first_unproven_boundary")
+        current_boundary = self._current_first_unproven_boundary(task)
+
+        later_provider_activity = bool(fault_at and getattr(task, "last_provider_request_at", 0) > fault_at)
+        later_assistant_activity = bool(fault_at and getattr(task, "last_agent_event_at", 0) > fault_at)
+        later_tool_activity = bool(
+            fault_at and (
+                getattr(task, "last_tool_start_at", 0) > fault_at
+                or getattr(task, "last_tool_end_at", 0) > fault_at
+            )
+        )
+        boundary_advanced = bool(
+            previous_boundary
+            and current_boundary
+            and current_boundary != previous_boundary
+        )
+        has_effect_evidence = (
+            later_provider_activity
+            or later_assistant_activity
+            or later_tool_activity
+            or boundary_advanced
+        )
+
+        if has_effect_evidence:
+            parts = []
+            if later_provider_activity:
+                parts.append("provider activity")
+            if later_assistant_activity:
+                parts.append("assistant activity")
+            if later_tool_activity:
+                parts.append("tool activity")
+            if boundary_advanced:
+                parts.append("FIRST_UNPROVEN_BOUNDARY advancement")
+            details = "Model-provider recovery evidenced by " + ", ".join(parts)
+        else:
+            details = (
+                "No later provider/assistant/tool activity and no "
+                "FIRST_UNPROVEN_BOUNDARY advancement observed after the provider fault"
+            )
+
+        return {
+            "provider_fault_at": fault_at,
+            "previous_first_unproven_boundary": previous_boundary,
+            "current_first_unproven_boundary": current_boundary,
+            "later_provider_activity": later_provider_activity,
+            "later_assistant_activity": later_assistant_activity,
+            "later_tool_activity": later_tool_activity,
+            "first_unproven_boundary_advanced": boundary_advanced,
+            "has_effect_evidence": has_effect_evidence,
+            "details": details,
+        }
+
+    def _collect_recovery_effect_evidence(self, task: DiscoveredTask, params: Dict, result: Dict) -> Dict:
+        """Require post-action runtime evidence instead of trusting executor return values."""
+        attempted_at = float(
+            result.get("attempted_at")
+            or params.get("_attempted_at")
+            or 0
+        )
+        previous_boundary = params.get("_first_unproven_boundary")
+        current_boundary = self._current_first_unproven_boundary(task)
+        claimed_count = int(result.get("claimed_count", 0) or 0)
+        has_effect_evidence = bool(result.get("success")) and claimed_count > 0
+        details = result.get("details", "")
+        if not details and not has_effect_evidence:
+            details = "No executor evidence observed yet"
+
+        return {
+            "attempted_at": attempted_at,
+            "previous_first_unproven_boundary": previous_boundary,
+            "current_first_unproven_boundary": current_boundary,
+            "claimed_count": claimed_count,
+            "has_effect_evidence": has_effect_evidence,
+            "details": details,
+        }
 
     def _execute_compact_context(self, task: DiscoveredTask) -> Dict:
         """Execute context compaction for a session."""
