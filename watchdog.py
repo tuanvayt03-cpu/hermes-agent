@@ -125,7 +125,7 @@ class HermesWatchdog:
         logger.info("Hermes Watchdog stopped")
     
     def _run_scan_cycle(self, cycle_number: int) -> ScanCycleResult:
-        """Execute a single scan cycle."""
+        """Execute a single scan cycle with V3 durable reconciliation."""
         start_time = time.time()
         tasks_discovered = 0
         tasks_classified = 0
@@ -159,6 +159,28 @@ class HermesWatchdog:
                 
                 # Record observation
                 self._record_observation(observed_task, cycle_number, classification)
+                
+                # V3: Load durable task state machine
+                durable_state = self.store.get_task_state_machine(observed_task.task_id)
+                
+                # V3: Validate checkpoint if exists
+                checkpoint_valid = True
+                if durable_state and durable_state.get("checkpoint_hash"):
+                    # TODO: Verify checkpoint against actual task state
+                    pass
+                
+                # V3: Determine desired state from durable state machine
+                desired_state = self._compute_desired_state(observed_task, durable_state, classification)
+                
+                # V3: Compare durable desired vs observed
+                reconciliation_action = self._reconcile_state(observed_task, durable_state, desired_state, classification)
+                
+                # V3: Persist transition event if state changed
+                if durable_state and self._state_changed(durable_state, desired_state):
+                    self._record_state_transition(observed_task.task_id, durable_state, desired_state, reconciliation_action)
+                
+                # V3: Update state machine with optimistic locking
+                self._update_task_state_machine(observed_task.task_id, desired_state, durable_state.get("state_version", 1) if durable_state else 1)
                 
                 # 3. Plan recovery if not in OBSERVE mode
                 if self.mode != "OBSERVE":
@@ -366,6 +388,265 @@ class HermesWatchdog:
                        f"classified={run['tasks_classified']} "
                        f"would_retry={run['recoveries_planned']} "
                        f"would_execute={run['recoveries_executed']}")
+
+    # V3: Durable reconciliation helpers
+    def _compute_desired_state(self, observed_task, durable_state, classification):
+        """Compute desired state from observation and durable state."""
+        desired = {}
+        
+        # Start with durable state as baseline
+        if durable_state:
+            desired.update({
+                "program_id": durable_state.get("program_id", "unknown"),
+                "generation": durable_state.get("generation", 1),
+                "goal": durable_state.get("goal"),
+                "capability": durable_state.get("capability"),
+                "first_unproven_boundary": durable_state.get("first_unproven_boundary"),
+                "accepted_baseline": durable_state.get("accepted_baseline"),
+                "completed_boundaries_json": durable_state.get("completed_boundaries_json"),
+                "active_writer_identity": durable_state.get("active_writer_identity"),
+                "active_transaction_id": durable_state.get("active_transaction_id"),
+                "pending_action": durable_state.get("pending_action"),
+                "last_completed_action": durable_state.get("last_completed_action"),
+                "side_effect_state": durable_state.get("side_effect_state", "NONE"),
+                "checkpoint_hash": durable_state.get("checkpoint_hash"),
+            })
+        
+        # Update from observation
+        desired["task_id"] = observed_task.task_id
+        desired["session_id"] = observed_task.session_id
+        
+        # Update from classification
+        if classification.state == "HEALTHY":
+            desired["side_effect_state"] = "NONE"
+        elif classification.state == "RECOVERY_PENDING":
+            desired["pending_action"] = classification.recovery_action
+        elif classification.state == "TERMINAL_COMPLETE":
+            desired["side_effect_state"] = "KNOWN_COMPLETE"
+        elif classification.state == "TERMINAL_BLOCKED":
+            desired["side_effect_state"] = "KNOWN_FAILED"
+        
+        return desired
+
+    def _reconcile_state(self, observed_task, durable_state, desired_state, classification):
+        """Reconcile observed state with durable desired state."""
+        # If no durable state, initialize new
+        if not durable_state:
+            return "INITIALIZE"
+        
+        # Check for side effect UNKNOWN
+        if durable_state.get("side_effect_state") == "UNKNOWN":
+            return "RECONCILE_SIDE_EFFECT"
+        
+        # Check for completed boundaries that should not be replayed
+        if durable_state.get("completed_boundaries_json"):
+            import json
+            completed = json.loads(durable_state["completed_boundaries_json"])
+            # If we're at a boundary that's already completed, don't replay
+            if desired_state.get("first_unproven_boundary") in completed:
+                return "SKIP_COMPLETED_BOUNDARY"
+        
+        # Check for active writer continuity
+        if durable_state.get("active_writer_identity"):
+            if not self._is_writer_alive(durable_state["active_writer_identity"]):
+                return "WRITER_DIED"
+        
+        # Check for invalidators (new evidence that invalidates durable state)
+        invalidators = self._detect_invalidators(observed_task, durable_state)
+        if invalidators:
+            return "INVALIDATE"
+        
+        # Default: continue with current plan
+        return "CONTINUE"
+
+    def _state_changed(self, durable_state, desired_state):
+        """Check if state has changed in a way that requires event."""
+        key_fields = [
+            "side_effect_state", "pending_action", "last_completed_action",
+            "first_unproven_boundary", "completed_boundaries_json",
+            "active_writer_identity", "active_transaction_id",
+            "pending_action", "side_effect_state"
+        ]
+        for field in key_fields:
+            if durable_state.get(field) != desired_state.get(field):
+                return True
+        return False
+
+    def _record_state_transition(self, task_id, old_state, new_state, action):
+        """Record a state transition event."""
+        event_data = {
+            "old_state": {k: old_state.get(k) for k in ["side_effect_state", "pending_action", "last_completed_action", "first_unproven_boundary", "completed_boundaries_json", "active_writer_identity", "active_transaction_id"]},
+            "new_state": {k: new_state.get(k) for k in ["side_effect_state", "pending_action", "last_completed_action", "first_unproven_boundary", "completed_boundaries_json", "active_writer_identity", "active_transaction_id"]},
+            "reconciliation_action": action,
+        }
+        event_identity = f"state_transition:{task_id}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="TASK_STATE_CHANGED",
+            event_data=event_data,
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_worker_started(self, task_id, worker_identity):
+        """Record worker started event."""
+        event_identity = f"worker_started:{task_id}:{worker_identity}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="WORKER_STARTED",
+            event_data={"worker_identity": worker_identity},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_worker_exited(self, task_id, worker_identity, exit_reason):
+        """Record worker exited event."""
+        event_identity = f"worker_exited:{task_id}:{worker_identity}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="WORKER_EXITED",
+            event_data={"worker_identity": worker_identity, "exit_reason": exit_reason},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_checkpoint_created(self, task_id, checkpoint_hash, boundary_name):
+        """Record checkpoint created event."""
+        event_identity = f"checkpoint:{task_id}:{boundary_name}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="CHECKPOINT_CREATED",
+            event_data={"checkpoint_hash": checkpoint_hash, "boundary_name": boundary_name},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_recovery_planned(self, task_id, recovery_action, failure_class):
+        """Record recovery planned event."""
+        event_identity = f"recovery_planned:{task_id}:{recovery_action}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="RECOVERY_PLANNED",
+            event_data={"recovery_action": recovery_action, "failure_class": failure_class},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_recovery_started(self, task_id, recovery_action):
+        """Record recovery started event."""
+        event_identity = f"recovery_started:{task_id}:{recovery_action}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="RECOVERY_STARTED",
+            event_data={"recovery_action": recovery_action},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_recovery_completed(self, task_id, recovery_action, success):
+        """Record recovery completed event."""
+        event_identity = f"recovery_completed:{task_id}:{recovery_action}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="RECOVERY_COMPLETED",
+            event_data={"recovery_action": recovery_action, "success": success},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_side_effect_unknown(self, task_id, side_effect_type, details):
+        """Record side effect unknown event."""
+        event_identity = f"side_effect_unknown:{task_id}:{side_effect_type}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="SIDE_EFFECT_UNKNOWN",
+            event_data={"side_effect_type": side_effect_type, "details": details},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_side_effect_reconciled(self, task_id, side_effect_type, new_state, evidence):
+        """Record side effect reconciled event."""
+        event_identity = f"side_effect_reconciled:{task_id}:{side_effect_type}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="SIDE_EFFECT_RECONCILED",
+            event_data={"side_effect_type": side_effect_type, "new_state": new_state, "evidence": evidence},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _record_task_completed(self, task_id, completed_boundaries, final_state):
+        """Record task completed event."""
+        event_identity = f"task_completed:{task_id}:{int(time.time() * 1000)}"
+        self.store.record_task_event(
+            task_id=task_id,
+            event_type="TASK_COMPLETED",
+            event_data={"completed_boundaries": completed_boundaries, "final_state": final_state},
+            event_identity=event_identity,
+            source_component="watchdog_reconciler"
+        )
+
+    def _update_task_state_machine(self, task_id, desired_state, expected_version):
+        """Update task state machine with optimistic locking."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            success = self.store.increment_state_version(task_id, expected_version)
+            if success:
+                # Version incremented, now upsert with new version
+                desired_state["state_version"] = expected_version + 1
+                self.store.upsert_task_state_machine(desired_state)
+                return True
+            else:
+                # Retry with fresh version
+                current = self.store.get_task_state_machine(task_id)
+                if current:
+                    expected_version = current.get("state_version", 1)
+                else:
+                    break
+        logger.warning(f"Failed to update state machine for {task_id} after {max_retries} retries")
+        return False
+
+    def _detect_invalidators(self, observed_task, durable_state):
+        """Detect new evidence that invalidates durable state."""
+        invalidators = []
+        
+        # Check for new provider error
+        if observed_task.provider_request_state and durable_state:
+            # If we have a new error that contradicts durable state
+            pass
+        
+        # Check for worker death
+        if durable_state.get("active_writer_identity") and not observed_task.worker_process_alive:
+            invalidators.append("WRITER_DEAD")
+        
+        # Check for explicit invalidation markers
+        if observed_task.explicit_markers.get("invalidate_checkpoint"):
+            invalidators.append("EXPLICIT_INVALIDATION")
+        
+        return invalidators
+
+    def _is_writer_alive(self, writer_identity):
+        """Check if writer process is still alive."""
+        try:
+            # Parse writer identity: "type:pid:start_time:cmd"
+            parts = writer_identity.split(":")
+            if len(parts) >= 3 and parts[1] == "pid":
+                pid = int(parts[2])
+                import psutil
+                proc = psutil.Process(pid)
+                if proc.is_running():
+                    # Verify start time matches
+                    create_time = int(proc.create_time() * 1000)
+                    # Extract start_time from identity
+                    start_time_part = [p for p in writer_identity.split(":") if p.startswith("start_time:")]
+                    if start_time_part:
+                        expected_start = int(start_time_part[0].split(":")[1])
+                        if abs(create_time - expected_start) < 10000:
+                            return True
+            return False
+        except Exception:
+            return False
 
 def main():
     parser = argparse.ArgumentParser(description="Hermes Watchdog V1")

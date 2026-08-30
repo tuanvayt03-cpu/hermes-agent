@@ -30,6 +30,7 @@ class HermesCapabilities:
     can_send_task_message: bool = False
     can_read_quota_state: bool = False
     can_compact_context: bool = False
+    can_reconcile_side_effect: bool = False
     probe_time: float = 0
     probe_errors: List[str] = field(default_factory=list)
 
@@ -193,6 +194,16 @@ class HermesAdapter:
                 logger.info("Capability: can_compact_context = True")
         except Exception as e:
             errors.append(f"can_compact_context: {e}")
+
+        # 9. Can reconcile side effect (via gateway session)
+        try:
+            import gateway.session
+            # Check if SessionStore has reconcile_side_effect capability
+            if hasattr(gateway.session.SessionStore, 'reconcile_side_effect'):
+                self.capabilities.can_reconcile_side_effect = True
+                logger.info("Capability: can_reconcile_side_effect = True")
+        except Exception as e:
+            errors.append(f"can_reconcile_side_effect: {e}")
 
         self.capabilities.probe_time = time.time()
         self.capabilities.probe_errors = errors
@@ -619,6 +630,16 @@ class HermesAdapter:
                     result["details"] = result_details.get("details", "Unknown error")
                 except Exception as e:
                     result["details"] = f"Context compaction failed: {e}"
+
+        elif action_type == "RECONCILE_SIDE_EFFECT":
+            # Side effect reconciliation - requires gateway context
+            if self.capabilities.can_reconcile_side_effect and task.session_key:
+                try:
+                    # This requires gateway context to actually reconcile
+                    # For now, mark as requiring gateway context
+                    result["details"] = "Side effect reconciliation requires gateway context"
+                except Exception as e:
+                    result["details"] = f"Side effect reconciliation failed: {e}"
 
         return result
 

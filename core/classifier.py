@@ -45,6 +45,8 @@ class RecoveryAction:
     NUDGE_AGENT = "NUDGE_AGENT"
     NO_ACTION = "NO_ACTION"
     COMPACT_CONTEXT = "COMPACT_CONTEXT"
+    RECONCILE_SIDE_EFFECT = "RECONCILE_SIDE_EFFECT"
+    VERIFY_RECOVERY = "VERIFY_RECOVERY"
 
 @dataclass
 class ClassificationResult:

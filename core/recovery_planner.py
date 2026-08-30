@@ -16,6 +16,7 @@ from core.classifier import (
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class RecoveryPlan:
     """A planned recovery action."""
@@ -30,63 +31,66 @@ class RecoveryPlan:
     lease_required: bool = True
     reasoning: str = ""
 
+
 class RecoveryPlanner:
     """Plans recovery actions based on task classification and available capabilities."""
-    
+
     def __init__(self, config: Dict, capabilities: Dict):
         self.config = config
         self.capabilities = capabilities or {}
         self.recovery_budgets = config.get("recovery_budgets", {})
-        
+
         # Recovery action priority (from spec) - V2 updated with CONTEXT_WINDOW_EXCEEDED
         self.action_priority = {
             RecoveryAction.COMPACT_CONTEXT: 0,  # Highest priority for context overflow
+            RecoveryAction.RECONCILE_SIDE_EFFECT: 0,  # Same priority - critical
             RecoveryAction.RETRY_TRANSPORT: 1,
             RecoveryAction.RESUME_SESSION: 2,
             RecoveryAction.NUDGE_AGENT: 3,
+            RecoveryAction.VERIFY_RECOVERY: 10,
             RecoveryAction.NO_ACTION: 99,
         }
-    
+
     def plan_recovery(self, task: 'DiscoveredTask', classification: ClassificationResult,
                        store: 'WatchdogStore', watchdog_id: str) -> List[RecoveryPlan]:
         """Generate recovery plans for a classified task."""
         plans = []
-        
+
         if classification.state == LifecycleState.TERMINAL_COMPLETE:
             # Never act on terminal complete
             return []
-        
+
         if classification.state == LifecycleState.TERMINAL_BLOCKED:
             # Never act on terminal blocked
             return []
-        
+
         if classification.state == LifecycleState.WAITING_EXTERNAL:
             # Don't auto-recover waiting states
             return []
-        
+
         if classification.state == LifecycleState.NEEDS_ATTENTION:
             # Unknown state - no automatic recovery
             return []
-        
+
         if classification.state == LifecycleState.HEALTHY:
             # No recovery needed
             return []
-        
+
         if classification.state == LifecycleState.BUSY:
             # Busy tasks need no intervention
             return []
-        
+
         if classification.state == LifecycleState.SUSPECTED_STALL:
             # Plan nudge if no safer recovery available
             if not self._has_safer_recovery(classification):
                 plan = self._create_nudge_plan(task, classification, watchdog_id)
                 if plan:
                     plans.append(plan)
-        
+
         if classification.state == LifecycleState.TRANSIENT_FAILURE:
             # Plan based on failure class and capability
             plans.extend(self._plan_for_transient_failure(task, classification, watchdog_id))
-        
+
         if classification.state == LifecycleState.RECOVERY_PENDING:
             # Check if previous recovery needs follow-up
             # For CONTEXT_WINDOW_EXCEEDED, plan COMPACT_CONTEXT
@@ -95,43 +99,57 @@ class RecoveryPlanner:
                     plan = self._create_compact_context_plan(task, classification, watchdog_id)
                     if plan:
                         plans.append(plan)
+            elif classification.failure_class == FailureClass.UNKNOWN:
+                # For UNKNOWN with side effect UNKNOWN, plan RECONCILE_SIDE_EFFECT
+                if self.capabilities.get("can_reconcile_side_effect"):
+                    # This will be set by the watchdog based on durable state
+                    pass
             else:
                 # Check if previous recovery needs follow-up
                 plans.extend(self._plan_followup(task, classification, store, watchdog_id))
-        
+
+        # V3: Plan RECONCILE_SIDE_EFFECT if durable state indicates UNKNOWN side effect
+        # This is triggered by the watchdog reconciler when durable state shows UNKNOWN
+        # The watchdog will inject this via task metadata or classification
+        if getattr(task, '_v3_reconcile_side_effect', False):
+            if self.capabilities.get("can_reconcile_side_effect"):
+                plan = self._create_reconcile_side_effect_plan(task, classification, watchdog_id)
+                if plan:
+                    plans.append(plan)
+
         # Sort by priority
         plans.sort(key=lambda p: p.priority)
         return plans
-    
+
     def _has_safer_recovery(self, classification: ClassificationResult) -> bool:
         """Check if a safer recovery action is available for this failure class."""
         if not classification.failure_class:
             return False
-        
+
         fc = classification.failure_class
-        
+
         # For provider overload, timeout, 429 - RETRY_TRANSPORT is preferred
         if fc in (FailureClass.PROVIDER_OVERLOAD, FailureClass.NETWORK_TRANSIENT, FailureClass.HTTP_429_TEMP):
             if self.capabilities.get("can_retry_transport"):
                 return True
-        
+
         return False
-    
-    def _plan_for_transient_failure(self, task: 'DiscoveredTask', 
+
+    def _plan_for_transient_failure(self, task: 'DiscoveredTask',
                                      classification: ClassificationResult,
                                      watchdog_id: str) -> List[RecoveryPlan]:
         """Plan recovery for transient failures."""
         plans = []
         fc = classification.failure_class
-        
+
         # Check retry budget
         budget = self.recovery_budgets.get(fc, {})
         max_retries = budget.get("max_retries", 0)
-        
+
         if max_retries <= 0:
             logger.info(f"No retry budget for {fc}, skipping recovery")
             return []
-        
+
         # Priority 1: RETRY_TRANSPORT (if supported)
         if self.capabilities.get("can_retry_transport") and fc in (
             FailureClass.PROVIDER_OVERLOAD, FailureClass.NETWORK_TRANSIENT, FailureClass.HTTP_429_TEMP
@@ -139,34 +157,34 @@ class RecoveryPlanner:
             plan = self._create_transport_retry_plan(task, classification, watchdog_id)
             if plan:
                 plans.append(plan)
-        
+
         # Priority 2: RESUME_SESSION (if supported and transport retry not available/failed)
         if self.capabilities.get("can_resume_session") and not plans:
             plan = self._create_resume_plan(task, classification, watchdog_id)
             if plan:
                 plans.append(plan)
-        
+
         # Priority 3: NUDGE_AGENT (last resort)
         if not plans and self.capabilities.get("can_send_task_message"):
             plan = self._create_nudge_plan(task, classification, watchdog_id)
             if plan:
                 plans.append(plan)
-        
+
         return plans
-    
+
     def _create_transport_retry_plan(self, task: 'DiscoveredTask',
                                       classification: ClassificationResult,
                                       watchdog_id: str) -> Optional[RecoveryPlan]:
         """Create a transport retry plan."""
         action_id = f"retry_transport_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         idempotency_key = f"transport_retry:{task.task_id}:{classification.failure_class}"
-        
+
         # Check if we've already executed this action recently
         if store := getattr(self, '_store', None):
             if store.has_action_idempotency_key(idempotency_key):
                 logger.debug(f"Transport retry already executed for {task.task_id}")
                 return None
-        
+
         return RecoveryPlan(
             action_id=action_id,
             task_id=task.task_id,
@@ -179,14 +197,14 @@ class RecoveryPlanner:
             lease_required=True,
             reasoning=f"Transport retry for {classification.failure_class}"
         )
-    
+
     def _create_resume_plan(self, task: 'DiscoveredTask',
                              classification: ClassificationResult,
                              watchdog_id: str) -> Optional[RecoveryPlan]:
         """Create a session resume plan."""
         action_id = f"resume_session_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         idempotency_key = f"resume_session:{task.task_id}:{task.session_key}"
-        
+
         return RecoveryPlan(
             action_id=action_id,
             task_id=task.task_id,
@@ -199,14 +217,14 @@ class RecoveryPlanner:
             lease_required=True,
             reasoning=f"Session resume for {classification.failure_class}"
         )
-    
+
     def _create_nudge_plan(self, task: 'DiscoveredTask',
                             classification: ClassificationResult,
                             watchdog_id: str) -> Optional[RecoveryPlan]:
         """Create an agent nudge plan."""
         action_id = f"nudge_agent_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         idempotency_key = f"nudge_agent:{task.task_id}:{int(time.time() // 3600)}"  # Hourly bucket
-        
+
         # Nudge is invasive - only if truly needed
         if classification.state != LifecycleState.SUSPECTED_STALL:
             if classification.state != LifecycleState.TRANSIENT_FAILURE:
@@ -214,13 +232,13 @@ class RecoveryPlanner:
             # For transient failure, only nudge if no other recovery available
             if self._has_safer_recovery(classification):
                 return None
-        
+
         # Check if we already nudged recently
         if store := getattr(self, '_store', None):
             if store.has_action_idempotency_key(idempotency_key):
                 logger.debug(f"Nudge already sent for {task.task_id} this hour")
                 return None
-        
+
         return RecoveryPlan(
             action_id=action_id,
             task_id=task.task_id,
@@ -237,20 +255,20 @@ class RecoveryPlanner:
             lease_required=True,
             reasoning=f"Agent nudge for suspected stall or unrecoverable transient failure"
         )
-    
+
     def _create_compact_context_plan(self, task: 'DiscoveredTask',
                              classification: ClassificationResult,
                              watchdog_id: str) -> Optional[RecoveryPlan]:
         """Create a context compaction plan."""
         action_id = f"compact_context_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         idempotency_key = f"compact_context:{task.task_id}:{classification.failure_class}"
-        
+
         # Check if we've already executed this action
         if store := getattr(self, '_store', None):
             if store.has_action_idempotency_key(idempotency_key):
                 logger.debug(f"Context compaction already executed for {task.task_id}")
                 return None
-        
+
         return RecoveryPlan(
             action_id=action_id,
             task_id=task.task_id,
@@ -268,12 +286,43 @@ class RecoveryPlanner:
             reasoning=f"Context compaction for {classification.failure_class}"
         )
 
+    def _create_reconcile_side_effect_plan(self, task: 'DiscoveredTask',
+                                            classification: ClassificationResult,
+                                            watchdog_id: str) -> Optional[RecoveryPlan]:
+        """Create a side effect reconciliation plan."""
+        action_id = f"reconcile_side_effect_{task.task_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        idempotency_key = f"reconcile_side_effect:{task.task_id}:{task.session_key}"
+
+        # Check if we've already executed this action
+        if store := getattr(self, '_store', None):
+            if store.has_action_idempotency_key(idempotency_key):
+                logger.debug(f"Side effect reconciliation already executed for {task.task_id}")
+                return None
+
+        return RecoveryPlan(
+            action_id=action_id,
+            task_id=task.task_id,
+            action_type=RecoveryAction.RECONCILE_SIDE_EFFECT,
+            failure_class=classification.failure_class,
+            priority=self.action_priority[RecoveryAction.RECONCILE_SIDE_EFFECT],
+            params={
+                "session_key": task.session_key,
+                "session_id": task.session_id,
+                "pending_action": getattr(task, '_v3_pending_action', None),
+                "last_completed_action": getattr(task, '_v3_last_completed_action', None),
+            },
+            idempotency_key=idempotency_key,
+            scheduled_at=time.time(),
+            lease_required=True,
+            reasoning=f"Side effect reconciliation for {task.task_id}"
+        )
+
     def _plan_followup(self, task: 'DiscoveredTask', classification: ClassificationResult,
                         store: 'WatchdogStore', watchdog_id: str) -> List[RecoveryPlan]:
         """Plan follow-up for tasks in RECOVERY_PENDING/RECOVERING state."""
         # Check recent recovery attempts
         attempts = store.get_pending_recovery_attempts(task.task_id)
-        
+
         plans = []
         for attempt in attempts:
             if attempt['status'] == 'executing':
@@ -294,9 +343,9 @@ class RecoveryPlanner:
                         reasoning="Verify recovery effect after timeout"
                     )
                     plans.append(plan)
-        
+
         return plans
-    
+
     def validate_plan(self, plan: RecoveryPlan, task: 'DiscoveredTask',
                        store: 'WatchdogStore') -> bool:
         """Validate a plan before execution."""
@@ -305,16 +354,16 @@ class RecoveryPlanner:
         if not current_task:
             logger.warning(f"Task {task.task_id} no longer exists")
             return False
-        
+
         # Check if task became terminal
         # Would need to re-classify - simplified for now
         if current_task.structured_state in ("COMPLETE", "BLOCKED", "TERMINAL"):
             logger.info(f"Task {task.task_id} became terminal, canceling recovery")
             return False
-        
+
         # Check idempotency
         if store.has_action_idempotency_key(plan.idempotency_key):
             logger.info(f"Action {plan.action_id} already executed (idempotency)")
             return False
-        
+
         return True
