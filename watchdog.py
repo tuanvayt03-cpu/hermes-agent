@@ -5,6 +5,7 @@ Global, project-agnostic watchdog that supervises all Hermes/Codex tasks.
 """
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -22,6 +23,7 @@ from persistence.sqlite_store import WatchdogStore
 from adapters.hermes_adapter import HermesAdapter, HermesCapabilities
 from core.classifier import LifecycleClassifier
 from core.recovery_planner import RecoveryPlanner
+from core.recovery_kernel import build_checkpoint_snapshot
 from core.scheduler import Scheduler, LeaseManager, ScanCycleResult
 
 # Configure logging
@@ -89,6 +91,8 @@ class HermesWatchdog:
                 "can_retry_transport": self.capabilities.can_retry_transport,
                 "can_resume_session": self.capabilities.can_resume_session,
                 "can_send_task_message": self.capabilities.can_send_task_message,
+                "can_compact_context": self.capabilities.can_compact_context,
+                "can_reconcile_side_effect": self.capabilities.can_reconcile_side_effect,
             }
         )
         self.planner._store = self.store  # Inject store for idempotency checks
@@ -166,8 +170,11 @@ class HermesWatchdog:
                 # V3: Validate checkpoint if exists
                 checkpoint_valid = True
                 if durable_state and durable_state.get("checkpoint_hash"):
-                    # TODO: Verify checkpoint against actual task state
-                    pass
+                    checkpoint_valid = self._validate_checkpoint(observed_task, durable_state)
+
+                invalidators = self._detect_invalidators(
+                    observed_task, durable_state or {}, checkpoint_valid=checkpoint_valid
+                )
                 
                 # V3: Determine desired state from durable state machine
                 desired_state = self._compute_desired_state(observed_task, durable_state, classification)
@@ -185,7 +192,9 @@ class HermesWatchdog:
                 # 3. Plan recovery if not in OBSERVE mode
                 if self.mode != "OBSERVE":
                     plans = self.planner.plan_recovery(
-                        observed_task, classification, self.store, self.watchdog_id
+                        observed_task, classification, self.store, self.watchdog_id,
+                        durable_state=durable_state, checkpoint_valid=checkpoint_valid,
+                        invalidators=invalidators,
                     )
                     recoveries_planned += len(plans)
                     
@@ -294,23 +303,25 @@ class HermesWatchdog:
             if self.mode == "OBSERVE":
                 return False
 
+            fault_domain = (plan.fault_envelope or {}).get("domain")
+
             if self.mode == "ACTIVE_CANARY":
                 # Only one recovery at a time in canary
                 if self.lease_manager._held_leases:
                     return False
-                # CONTEXT_WINDOW_EXCEEDED uses COMPACT_CONTEXT - allow in canary
-                if plan.failure_class == "CONTEXT_WINDOW_EXCEEDED":
+                # Context recovery must stay on compaction primitive.
+                if fault_domain == "context":
                     if plan.action_type != "COMPACT_CONTEXT" and self.capabilities.can_compact_context:
                         return False
-                # Only low-risk transient cases
-                elif plan.failure_class not in ("PROVIDER_OVERLOAD", "NETWORK_TRANSIENT"):
+                # Only transport recovery and read-only verification are allowed in canary.
+                elif fault_domain not in ("transport", "verify"):
                     return False
-                # Prefer RETRY_TRANSPORT for transient
-                elif plan.action_type != "RETRY_TRANSPORT" and self.capabilities.can_retry_transport:
+                # Prefer the lowest-risk transport primitive.
+                elif fault_domain == "transport" and plan.action_type not in ("RETRY_TRANSPORT", "VERIFY_RECOVERY") and self.capabilities.can_retry_transport:
                     return False
             elif self.mode == "ACTIVE_GLOBAL":
-                # For CONTEXT_WINDOW_EXCEEDED in ACTIVE_GLOBAL, allow COMPACT_CONTEXT
-                if plan.failure_class == "CONTEXT_WINDOW_EXCEEDED":
+                # In global mode context recovery still requires the compaction primitive.
+                if fault_domain == "context":
                     if plan.action_type != "COMPACT_CONTEXT" and self.capabilities.can_compact_context:
                         return False
 
@@ -336,10 +347,48 @@ class HermesWatchdog:
         )
         
         self.store.update_recovery_attempt(plan.action_id, "executing")
+        self._record_recovery_started(plan.task_id, plan.action_type)
         
         try:
+            durable_state = self.store.get_task_state_machine(plan.task_id) or {}
+            checkpoint_valid = True
+            if durable_state.get("checkpoint_hash"):
+                checkpoint_valid = self._validate_checkpoint(task, durable_state)
+
+            fresh_invalidators = self._detect_invalidators(
+                task, durable_state, checkpoint_valid=checkpoint_valid
+            )
+            if fresh_invalidators:
+                verification = {
+                    "verified": False,
+                    "effect_state": "BLOCKED",
+                    "details": "Fresh invalidator authority blocks mutating recovery execution",
+                    "evidence": {"invalidators": fresh_invalidators, "task_id": plan.task_id},
+                }
+                self.store.update_recovery_attempt(
+                    plan.action_id, "failed",
+                    result_json=self._json_dumps({"verification": verification}),
+                    evidence_json=self._json_dumps(verification["evidence"])
+                )
+                self._record_recovery_completed(plan.task_id, plan.action_type, False)
+                return False
+
+            checkpoint_hash = self._ensure_recovery_checkpoint(task, plan, durable_state)
+            execution_params = dict(plan.params)
+            execution_params["_fault_envelope"] = plan.fault_envelope or {}
+            execution_params["_checkpoint_hash"] = checkpoint_hash
+
             # Execute via adapter
-            result = self.adapter.execute_recovery(plan.action_type, task, plan.params)
+            result = self.adapter.execute_recovery(plan.action_type, task, execution_params)
+            verification = self.adapter.verify_recovery_effect(
+                plan.action_type, task, execution_params, result
+            )
+            combined_result = {
+                "result": result,
+                "verification": verification,
+                "fault_envelope": plan.fault_envelope or {},
+                "checkpoint_hash": checkpoint_hash,
+            }
             
             # Record action with idempotency key
             executed = self.store.record_recovery_action(
@@ -347,16 +396,23 @@ class HermesWatchdog:
                 task_id=plan.task_id,
                 action_type=plan.action_type,
                 idempotency_key=plan.idempotency_key,
-                result_summary=str(result)
+                result_summary=self._json_dumps(combined_result)
             )
             
             if executed:
-                self.store.update_recovery_attempt(
-                    plan.action_id, "executed", 
-                    result_json=str(result),
-                    evidence_json=f'{{"task_id": "{plan.task_id}"}}'
+                status = "executed" if verification.get("verified") else (
+                    "failed" if plan.action_type == "VERIFY_RECOVERY" else "executing"
                 )
-                logger.info(f"Recovery executed successfully: {plan.action_id}")
+                self.store.update_recovery_attempt(
+                    plan.action_id, status,
+                    result_json=self._json_dumps(combined_result),
+                    evidence_json=self._json_dumps(verification.get("evidence", {"task_id": plan.task_id}))
+                )
+                self._record_recovery_completed(plan.task_id, plan.action_type, bool(verification.get("verified")))
+                if verification.get("verified"):
+                    logger.info(f"Recovery effect verified: {plan.action_id}")
+                else:
+                    logger.warning(f"Recovery effect not yet verified: {plan.action_id}")
             else:
                 self.store.update_recovery_attempt(
                     plan.action_id, "skipped",
@@ -364,7 +420,7 @@ class HermesWatchdog:
                 )
                 logger.info(f"Recovery skipped (idempotent): {plan.action_id}")
             
-            return executed
+            return executed and bool(verification.get("verified"))
             
         except Exception as e:
             logger.error(f"Recovery execution failed: {e}")
@@ -372,6 +428,7 @@ class HermesWatchdog:
                 plan.action_id, "failed",
                 result_json=f"Error: {e}"
             )
+            self._record_recovery_completed(plan.task_id, plan.action_type, False)
             return False
         finally:
             if plan.lease_required:
@@ -607,14 +664,18 @@ class HermesWatchdog:
         logger.warning(f"Failed to update state machine for {task_id} after {max_retries} retries")
         return False
 
-    def _detect_invalidators(self, observed_task, durable_state):
+    def _detect_invalidators(self, observed_task, durable_state, checkpoint_valid: bool = True):
         """Detect new evidence that invalidates durable state."""
         invalidators = []
         
         # Check for new provider error
         if observed_task.provider_request_state and durable_state:
             # If we have a new error that contradicts durable state
-            pass
+            if durable_state.get("pending_action") or durable_state.get("side_effect_state") == "KNOWN_COMPLETE":
+                invalidators.append("PROVIDER_STATE_CONTRADICTION")
+        
+        if durable_state.get("checkpoint_hash") and not checkpoint_valid:
+            invalidators.append("CHECKPOINT_MISMATCH")
         
         # Check for worker death
         if durable_state.get("active_writer_identity") and not observed_task.worker_process_alive:
@@ -625,6 +686,58 @@ class HermesWatchdog:
             invalidators.append("EXPLICIT_INVALIDATION")
         
         return invalidators
+
+    def _validate_checkpoint(self, observed_task, durable_state):
+        """Validate the durable checkpoint hash against current observed state."""
+        expected = durable_state.get("checkpoint_hash")
+        if not expected:
+            return True
+        current_hash, _ = build_checkpoint_snapshot(observed_task, durable_state)
+        return current_hash == expected
+
+    def _ensure_recovery_checkpoint(self, task, plan, durable_state):
+        """Persist a deterministic checkpoint before mutating recovery primitives."""
+        if plan.action_type == "VERIFY_RECOVERY":
+            return durable_state.get("checkpoint_hash")
+
+        checkpoint_hash, _ = build_checkpoint_snapshot(
+            task,
+            durable_state,
+            None if not plan.fault_envelope else type("FaultView", (), {"to_dict": lambda self: plan.fault_envelope})()
+        )
+        if durable_state.get("checkpoint_hash") == checkpoint_hash:
+            return checkpoint_hash
+
+        checkpoint_state = dict(durable_state)
+        checkpoint_state.update({
+            "task_id": task.task_id,
+            "program_id": durable_state.get("program_id") or f"program:{task.task_id}",
+            "generation": durable_state.get("generation", 1),
+            "goal": durable_state.get("goal") or task.metadata.get("goal"),
+            "capability": durable_state.get("capability") or task.metadata.get("capability") or "codex",
+            "first_unproven_boundary": durable_state.get("first_unproven_boundary")
+                or (plan.fault_envelope or {}).get("evidence", {}).get("first_unproven_boundary")
+                or (plan.fault_envelope or {}).get("kind")
+                or plan.action_type,
+            "active_writer_identity": durable_state.get("active_writer_identity"),
+            "active_transaction_id": durable_state.get("active_transaction_id"),
+            "pending_action": durable_state.get("pending_action") or plan.action_type,
+            "last_completed_action": durable_state.get("last_completed_action"),
+            "side_effect_state": durable_state.get("side_effect_state", "NONE"),
+            "checkpoint_hash": checkpoint_hash,
+            "state_version": durable_state.get("state_version", 1),
+        })
+        self.store.upsert_task_state_machine(checkpoint_state)
+        self._record_checkpoint_created(
+            task.task_id,
+            checkpoint_hash,
+            checkpoint_state["first_unproven_boundary"],
+        )
+        return checkpoint_hash
+
+    def _json_dumps(self, payload):
+        """Serialize JSON payloads for durable evidence storage."""
+        return json.dumps(payload, default=str, sort_keys=True)
 
     def _is_writer_alive(self, writer_identity):
         """Check if writer process is still alive."""

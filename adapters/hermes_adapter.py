@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from core.recovery_kernel import RecoveryCapabilityRegistry
+
 logger = logging.getLogger(__name__)
 
 
@@ -212,6 +214,10 @@ class HermesAdapter:
             logger.warning(f"Capability probe errors: {errors}")
 
         return self.capabilities
+
+    def get_recovery_capability_registry(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Return the enabled recovery primitive registry by domain."""
+        return RecoveryCapabilityRegistry(self.capabilities).to_dict()
 
     def discover_tasks(self) -> List[DiscoveredTask]:
         """Discover all active Hermes tasks/sessions."""
@@ -593,6 +599,8 @@ class HermesAdapter:
     def execute_recovery(self, action_type: str, task: DiscoveredTask, params: Dict) -> Dict:
         """Execute a recovery action. Returns result dict."""
         result = {"success": False, "action": action_type, "details": ""}
+        result["fault_domain"] = (params.get("_fault_envelope") or {}).get("domain")
+        result["checkpoint_hash"] = params.get("_checkpoint_hash")
 
         if action_type == "RETRY_TRANSPORT":
             # Use delivery_ledger sweep_recoverable
@@ -601,6 +609,7 @@ class HermesAdapter:
                     claimed = self._delivery_ledger.sweep_recoverable(
                         deliverable_platforms={"telegram"}  # Adjust as needed
                     )
+                    result["claimed_count"] = len(claimed)
                     result["success"] = len(claimed) > 0
                     result["details"] = f"Claimed {len(claimed)} obligations for redelivery"
                 except Exception as e:
@@ -641,7 +650,64 @@ class HermesAdapter:
                 except Exception as e:
                     result["details"] = f"Side effect reconciliation failed: {e}"
 
+        elif action_type == "VERIFY_RECOVERY":
+            result["success"] = True
+            result["details"] = "Verification requested; no mutating action executed"
+
         return result
+
+    def verify_recovery_effect(self, action_type: str, task: DiscoveredTask,
+                               params: Dict, result: Optional[Dict]) -> Dict:
+        """Verify recovery effect using action result and current task evidence."""
+        fault = params.get("_fault_envelope") or {}
+        evidence = {
+            "task_id": task.task_id,
+            "action_type": action_type,
+            "fault_domain": fault.get("domain"),
+            "checkpoint_hash": params.get("_checkpoint_hash"),
+            "provider_request_state": getattr(task, "provider_request_state", ""),
+        }
+        verification = {
+            "verified": False,
+            "effect_state": "UNKNOWN",
+            "evidence": evidence,
+            "details": "",
+        }
+        result = result or {}
+
+        if action_type == "RETRY_TRANSPORT":
+            claimed_count = int(result.get("claimed_count", 0) or 0)
+            verification["verified"] = bool(result.get("success")) and claimed_count > 0
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
+            verification["details"] = result.get("details", "")
+        elif action_type == "COMPACT_CONTEXT":
+            verification["verified"] = bool(result.get("success"))
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
+            verification["details"] = result.get("details", "")
+        elif action_type == "RECONCILE_SIDE_EFFECT":
+            verification["verified"] = bool(result.get("success"))
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
+            verification["details"] = result.get("details", "")
+        elif action_type == "RESUME_SESSION":
+            verification["verified"] = bool(result.get("success"))
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
+            verification["details"] = result.get("details", "")
+        elif action_type == "NUDGE_AGENT":
+            verification["verified"] = bool(result.get("success"))
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "UNKNOWN"
+            verification["details"] = result.get("details", "")
+        elif action_type == "VERIFY_RECOVERY":
+            still_invalidated = bool(task.explicit_markers.get("invalidate_checkpoint"))
+            still_faulting = bool(getattr(task, "provider_request_state", ""))
+            verification["verified"] = not still_invalidated and not still_faulting
+            verification["effect_state"] = "VERIFIED" if verification["verified"] else "PENDING"
+            verification["details"] = (
+                "Recovery authority verified from current task evidence"
+                if verification["verified"]
+                else "Current task evidence still shows an open invalidator or active fault"
+            )
+
+        return verification
 
     def _execute_compact_context(self, task: DiscoveredTask) -> Dict:
         """Execute context compaction for a session."""

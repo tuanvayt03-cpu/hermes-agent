@@ -18,7 +18,7 @@ watchdog_root = Path(__file__).parent.parent
 sys.path.insert(0, str(watchdog_root))
 
 from persistence.sqlite_store import WatchdogStore, TaskRecord, ObservationRecord
-from core.classifier import LifecycleClassifier, ClassificationResult, LifecycleState, FailureClass
+from core.classifier import LifecycleClassifier, ClassificationResult, LifecycleState, FailureClass, RecoveryAction
 from core.scheduler import LeaseManager, Scheduler, ScanCycleResult
 from adapters.hermes_adapter import HermesAdapter, DiscoveredTask, HermesCapabilities
 
@@ -860,6 +860,245 @@ class TestV3DurableWorkflow(unittest.TestCase):
         
         updated = self.store.get_task_state_machine(task_id)
         self.assertEqual(updated["active_writer_identity"], "codex:pid:67890:start_time:1788000100:cmd:codex exec")
+
+
+class TestRecoveryKernel(unittest.TestCase):
+    """Focused tests for the generic recovery kernel."""
+
+    def test_fault_envelope_normalizes_transport_failures(self):
+        from core.recovery_kernel import build_fault_envelope
+
+        task = MockTask(provider_request_state="RATE_LIMITED")
+        classification = ClassificationResult(
+            state=LifecycleState.TRANSIENT_FAILURE,
+            confidence=0.9,
+            failure_class=FailureClass.HTTP_429_TEMP,
+            recovery_action=RecoveryAction.RETRY_TRANSPORT,
+            evidence={},
+            reasoning="Rate limit",
+        )
+
+        envelope = build_fault_envelope(task, classification, durable_state={})
+
+        self.assertIsNotNone(envelope)
+        self.assertEqual(envelope.domain, "transport")
+        self.assertEqual(envelope.kind, FailureClass.HTTP_429_TEMP)
+        self.assertFalse(envelope.requires_checkpoint)
+
+    def test_capability_registry_returns_domain_primitives(self):
+        from core.recovery_kernel import RecoveryCapabilityRegistry
+
+        registry = RecoveryCapabilityRegistry({
+            "can_retry_transport": True,
+            "can_resume_session": True,
+            "can_send_task_message": True,
+        })
+
+        primitives = registry.primitives_for_domain("transport")
+        action_types = [primitive.action_type for primitive in primitives]
+
+        self.assertEqual(action_types[:3], [
+            RecoveryAction.RETRY_TRANSPORT,
+            RecoveryAction.RESUME_SESSION,
+            RecoveryAction.NUDGE_AGENT,
+        ])
+
+    def test_planner_uses_verify_recovery_when_invalidator_present(self):
+        from core.recovery_planner import RecoveryPlanner
+
+        planner = RecoveryPlanner(
+            {"recovery_budgets": {FailureClass.NETWORK_TRANSIENT: {"max_retries": 2}}},
+            {"can_retry_transport": True},
+        )
+        task = MockTask(provider_request_state="TIMEOUT")
+        classification = ClassificationResult(
+            state=LifecycleState.TRANSIENT_FAILURE,
+            confidence=0.8,
+            failure_class=FailureClass.NETWORK_TRANSIENT,
+            recovery_action=RecoveryAction.RETRY_TRANSPORT,
+            evidence={},
+            reasoning="Timeout",
+        )
+
+        plans = planner.plan_recovery(
+            task,
+            classification,
+            store=None,
+            watchdog_id="test_watchdog",
+            durable_state={"pending_action": "write_file"},
+            checkpoint_valid=False,
+            invalidators=["CHECKPOINT_MISMATCH"],
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].action_type, RecoveryAction.VERIFY_RECOVERY)
+
+
+class TestRecoveryExecution(unittest.TestCase):
+    """Focused execution-path tests for checkpoint-first recovery."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test_watchdog.db")
+        self.store = WatchdogStore(self.db_path)
+        from persistence.sqlite_store import TaskRecord
+
+        task = TaskRecord(
+            task_id="exec_task",
+            session_id="exec_session",
+            session_key="exec_key",
+            source="desktop",
+            platform="local",
+            cwd="/test",
+            git_repo_root="/test",
+            first_seen_at=time.time(),
+            last_seen_at=time.time(),
+            last_activity_at=time.time(),
+            last_activity_description="test",
+            structured_state="RUNNING",
+            is_active=1,
+            metadata_json="{}"
+        )
+        self.store.upsert_task(task)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _build_watchdog(self):
+        from watchdog import HermesWatchdog
+
+        watchdog = HermesWatchdog.__new__(HermesWatchdog)
+        watchdog.store = self.store
+        watchdog.mode = "ACTIVE_GLOBAL"
+        watchdog.watchdog_id = "test_watchdog"
+        watchdog.capabilities = type("Caps", (), {
+            "can_retry_transport": True,
+            "can_resume_session": True,
+            "can_send_task_message": True,
+            "can_compact_context": True,
+            "can_reconcile_side_effect": True,
+        })()
+        watchdog.lease_manager = type("LeaseManager", (), {
+            "try_acquire_lease": staticmethod(lambda task_id, action_id: True),
+            "release_lease": staticmethod(lambda task_id, action_id: True),
+            "_held_leases": {},
+        })()
+        return watchdog
+
+    def test_execute_recovery_creates_checkpoint_and_verifies_effect(self):
+        from core.recovery_planner import RecoveryPlan
+
+        watchdog = self._build_watchdog()
+
+        class Adapter:
+            def execute_recovery(self, action_type, task, params):
+                return {"success": True, "action": action_type, "claimed_count": 1, "details": "claimed"}
+
+            def verify_recovery_effect(self, action_type, task, params, result):
+                return {
+                    "verified": True,
+                    "effect_state": "VERIFIED",
+                    "details": "verified",
+                    "evidence": {"checkpoint_hash": params.get("_checkpoint_hash"), "task_id": task.task_id},
+                }
+
+        watchdog.adapter = Adapter()
+
+        plan = RecoveryPlan(
+            action_id="retry_transport_exec_task",
+            task_id="exec_task",
+            action_type=RecoveryAction.RETRY_TRANSPORT,
+            failure_class=FailureClass.NETWORK_TRANSIENT,
+            priority=1,
+            params={"platform": "local", "session_key": "exec_key"},
+            idempotency_key="transport_retry:exec_task:NETWORK_TRANSIENT",
+            scheduled_at=time.time(),
+            fault_envelope={
+                "fault_id": "fault1",
+                "task_id": "exec_task",
+                "domain": "transport",
+                "kind": FailureClass.NETWORK_TRANSIENT,
+                "lifecycle_state": LifecycleState.TRANSIENT_FAILURE,
+                "recovery_action": RecoveryAction.RETRY_TRANSPORT,
+                "requires_checkpoint": False,
+                "checkpoint_hash": None,
+                "invalidators": [],
+                "evidence": {},
+            },
+        )
+        task = MockTask(task_id="exec_task", session_id="exec_session", session_key="exec_key")
+
+        success = watchdog._execute_recovery(plan, task)
+
+        self.assertTrue(success)
+        state = self.store.get_task_state_machine("exec_task")
+        self.assertIsNotNone(state)
+        self.assertTrue(state["checkpoint_hash"].startswith("sha256:"))
+        attempt = self.store.get_recovery_attempt(plan.action_id)
+        self.assertEqual(attempt["status"], "executed")
+        action = self.store.has_action_idempotency_key(plan.idempotency_key)
+        self.assertTrue(action)
+
+    def test_execute_recovery_fails_closed_on_fresh_invalidator(self):
+        from core.recovery_planner import RecoveryPlan
+
+        watchdog = self._build_watchdog()
+
+        class Adapter:
+            def execute_recovery(self, action_type, task, params):
+                raise AssertionError("mutating recovery should not execute under fresh invalidator")
+
+            def verify_recovery_effect(self, action_type, task, params, result):
+                raise AssertionError("verification should not run when execution is blocked")
+
+        watchdog.adapter = Adapter()
+        self.store.upsert_task_state_machine({
+            "task_id": "exec_task",
+            "program_id": "test_program",
+            "generation": 1,
+            "goal": "Test",
+            "capability": "codex",
+            "pending_action": "write_file",
+            "checkpoint_hash": "sha256:stale",
+            "state_version": 1,
+        })
+
+        plan = RecoveryPlan(
+            action_id="retry_transport_exec_task_blocked",
+            task_id="exec_task",
+            action_type=RecoveryAction.RETRY_TRANSPORT,
+            failure_class=FailureClass.NETWORK_TRANSIENT,
+            priority=1,
+            params={"platform": "local", "session_key": "exec_key"},
+            idempotency_key="transport_retry:exec_task:blocked",
+            scheduled_at=time.time(),
+            fault_envelope={
+                "fault_id": "fault2",
+                "task_id": "exec_task",
+                "domain": "transport",
+                "kind": FailureClass.NETWORK_TRANSIENT,
+                "lifecycle_state": LifecycleState.TRANSIENT_FAILURE,
+                "recovery_action": RecoveryAction.RETRY_TRANSPORT,
+                "requires_checkpoint": False,
+                "checkpoint_hash": "sha256:stale",
+                "invalidators": [],
+                "evidence": {},
+            },
+        )
+        task = MockTask(
+            task_id="exec_task",
+            session_id="exec_session",
+            session_key="exec_key",
+            provider_request_state="TIMEOUT",
+        )
+
+        success = watchdog._execute_recovery(plan, task)
+
+        self.assertFalse(success)
+        attempt = self.store.get_recovery_attempt(plan.action_id)
+        self.assertEqual(attempt["status"], "failed")
+        self.assertFalse(self.store.has_action_idempotency_key(plan.idempotency_key))
 
 
 class TestLeaseManager(unittest.TestCase):
