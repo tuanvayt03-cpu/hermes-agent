@@ -1,0 +1,34 @@
+{
+  "verified_at": "2026-08-31T15:10:10.019754+07:00",
+  "apply_result": {
+    "target": "codex",
+    "status": "ALREADY_CONFIGURED",
+    "rule_path": "C:\\Users\\Vu Tuan\\.codex\\AGENTS.md",
+    "rule_version": "AGENT-OS-V1-20260831-7F3C72A1",
+    "rule_loaded": true,
+    "existing_user_content_preserved": true,
+    "idempotent_second_apply": true,
+    "applied": true
+  },
+  "readback": {
+    "exists": true,
+    "managed_block_present": true,
+    "rule_loaded": true,
+    "rule_version": "AGENT-OS-V1-20260831-7F3C72A1"
+  },
+  "final": {
+    "agent_os_rule_version": "AGENT-OS-V1-20260831-7F3C72A1",
+    "prior_work_reuse": true,
+    "no_full_rediscovery_on_proven_work": true,
+    "first_unproven_boundary_resume": true,
+    "one_writer_semantics": true,
+    "no_meaningful_ceremony_for_tiny_task": true,
+    "next_action": "IMPLEMENT_TINY"
+  },
+  "command_execution_completed": 1,
+  "used_update_plan": false,
+  "agent_message_count": 1,
+  "commands": [
+    "\"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -Command \"python \\\"C:/Users/Vu Tuan/AppData/Local/hermes/hermes-agent/scripts/prior_work_first.py\\\" check --repo-root \\\".\\\" --packet \\\"C:\\\\Users\\\\Vu Tuan\\\\AppData\\\\Local\\\\hermes\\\\hermes-agent\\\\.pytest-tmp-agent-os\\\\codex-canary\\\\repo\\\\.task-state\\\\prior-work-first\\\\demo-capability\\\\active.packet.json\\\" --machine-evidence \\\"C:\\\\Users\\\\Vu Tuan\\\\AppData\\\\Local\\\\hermes\\\\hermes-agent\\\\.pytest-tmp-agent-os\\\\codex-canary\\\\repo\\\\machine_evidence.json\\\"\""
+  ]
+}

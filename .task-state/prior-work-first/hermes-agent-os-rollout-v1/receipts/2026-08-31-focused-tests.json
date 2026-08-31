@@ -1,0 +1,13 @@
+{
+  "PROGRAM_ID": "HERMES-AGENT-OS-ROLLOUT-V1",
+  "CAPABILITY_ID": "HERMES-AGENT-OS-ROLLOUT-V1",
+  "STATUS": "PASS",
+  "VERIFIED_AT": "2026-08-31T15:10:10.019754+07:00",
+  "TEST_COMMANDS": [
+    {
+      "command": "python -m pytest tests/agent/test_prior_work_first.py tests/agent/test_continuous_completion.py tests/agent/test_agent_os_install.py --basetemp .pytest-tmp-agent-os",
+      "result": "PASS",
+      "details": "19 passed, 1 warning in 2.43s"
+    }
+  ]
+}
