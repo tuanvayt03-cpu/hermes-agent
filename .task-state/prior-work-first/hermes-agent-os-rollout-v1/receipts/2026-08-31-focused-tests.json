@@ -2,12 +2,24 @@
   "PROGRAM_ID": "HERMES-AGENT-OS-ROLLOUT-V1",
   "CAPABILITY_ID": "HERMES-AGENT-OS-ROLLOUT-V1",
   "STATUS": "PASS",
-  "VERIFIED_AT": "2026-08-31T15:10:10.019754+07:00",
+  "VERIFIED_AT": "2026-08-31T22:02:51.0748883+07:00",
+  "HEAD": "f78d0ecb2afc54f150627b1e18eb8a56a6b077c2",
+  "TREE": "6d0619a19cbe5bc2c40e9cbceae6805ea3c7dd97",
   "TEST_COMMANDS": [
     {
-      "command": "python -m pytest tests/agent/test_prior_work_first.py tests/agent/test_continuous_completion.py tests/agent/test_agent_os_install.py --basetemp .pytest-tmp-agent-os",
+      "command": "venv\\Scripts\\python.exe -m pytest tests/agent/test_agent_os_native_integration.py -q --basetemp .pytest-tmp-agent-os-native-red\\basetemp -p no:cacheprovider",
       "result": "PASS",
-      "details": "19 passed, 1 warning in 2.43s"
+      "details": "4 passed in 3.15s"
+    },
+    {
+      "command": "venv\\Scripts\\python.exe -m pytest tests/agent/test_agent_os_install.py tests/agent/test_continuous_completion.py -q --basetemp .pytest-tmp-agent-os-required\\basetemp -p no:cacheprovider",
+      "result": "PASS",
+      "details": "9 passed in 0.54s"
+    },
+    {
+      "command": "venv\\Scripts\\python.exe -m pytest tests/agent/test_agent_os_native_integration.py -q --basetemp .pytest-tmp-agent-os-native-green\\basetemp -p no:cacheprovider",
+      "result": "PASS",
+      "details": "4 passed in 3.07s"
     }
   ]
 }
