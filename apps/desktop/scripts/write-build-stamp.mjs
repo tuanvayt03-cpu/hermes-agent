@@ -26,13 +26,33 @@
  * commit as unpinned and follows the branch instead of fetching a fake SHA.
  */
 
-import { mkdirSync, writeFileSync } from "fs"
-import { resolve, join, relative } from "path"
-import { execSync } from "child_process"
+import { createHash } from "crypto"
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs"
+import { resolve, join, relative, delimiter } from "path"
+import { execSync, execFileSync } from "child_process"
 
 import { isMain } from "./utils.mjs"
 
 const STAMP_SCHEMA_VERSION = 1
+export const AGENT_OS_NATIVE_PROMPT_MAX_BYTES = 4096
+export const AGENT_OS_RUNTIME_FILES = Object.freeze([
+  "AGENT_OS_CORE.md",
+  "agent/prompt_builder.py",
+  "agent/agent_os_install.py",
+])
+export const AGENT_OS_SEMANTIC_TERMS = Object.freeze([
+  "GOAL",
+  "CAPABILITY_ID",
+  "PRIOR_WORK_LOCATE",
+  "ACCEPTED_BASELINE",
+  "FIRST_UNPROVEN_BOUNDARY",
+  "INVALIDATOR_CHECK",
+  "READY_FRONTIER",
+  "CRITICAL_PATH",
+  "PARALLEL_SAFE_FRONTIER",
+  "BROKER_UNKNOWN",
+])
+export const AGENT_OS_WRITER_TERM = "ONE_PRIMARY_WRITER"
 
 /** All-zero placeholder used when no real commit can be resolved. */
 export const FALLBACK_COMMIT = "0000000000000000000000000000000000000000"
@@ -42,6 +62,125 @@ const DESKTOP_ROOT = resolve(import.meta.dirname, "..")
 const REPO_ROOT = resolve(DESKTOP_ROOT, "..", "..")
 const OUT_DIR = join(DESKTOP_ROOT, "build")
 const OUT_FILE = join(OUT_DIR, "install-stamp.json")
+const AGENT_OS_RULE_VERSION_RE = /^AGENT_OS_RULE_VERSION:\s*(\S+)\s*$/m
+
+function sha256Text(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex")
+}
+
+function resolvePythonInvocation(repoRoot = REPO_ROOT) {
+  const candidates = process.platform === "win32"
+    ? [
+        { command: join(repoRoot, ".venv", "Scripts", "python.exe"), args: [] },
+        { command: join(repoRoot, "venv", "Scripts", "python.exe"), args: [] },
+        { command: "python", args: [] },
+        { command: "py", args: ["-3"] },
+      ]
+    : [
+        { command: join(repoRoot, ".venv", "bin", "python"), args: [] },
+        { command: join(repoRoot, "venv", "bin", "python"), args: [] },
+        { command: "python3", args: [] },
+        { command: "python", args: [] },
+      ]
+
+  for (const candidate of candidates) {
+    if (!candidate.command.includes("/") && !candidate.command.includes("\\")) {
+      return candidate
+    }
+    if (existsSync(candidate.command)) {
+      return candidate
+    }
+  }
+
+  return candidates[candidates.length - 1]
+}
+
+export function renderAgentOsRuntimePrompt({
+  repoRoot = REPO_ROOT,
+  execFileSyncFn = execFileSync,
+} = {}) {
+  const repoPath = resolve(repoRoot)
+  const python = resolvePythonInvocation(repoPath)
+  const env = {
+    ...process.env,
+    PYTHONPATH: [repoPath, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+  }
+  const script = [
+    "import json",
+    "from agent.agent_os_install import MANAGED_BEGIN, MANAGED_END, render_hermes_native_prompt",
+    "payload = {",
+    "  'prompt': render_hermes_native_prompt('.'),",
+    "  'managed_begin': MANAGED_BEGIN,",
+    "  'managed_end': MANAGED_END,",
+    "}",
+    "print(json.dumps(payload))",
+  ].join("\n")
+  const raw = execFileSyncFn(python.command, [...python.args, "-c", script], {
+    cwd: repoPath,
+    env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim()
+
+  return JSON.parse(raw)
+}
+
+export function buildAgentOsRuntimeBinding({
+  repoRoot = REPO_ROOT,
+  readTextFn = (filePath) => readFileSync(filePath, "utf8"),
+  renderPromptFn = (root) => renderAgentOsRuntimePrompt({ repoRoot: root }),
+} = {}) {
+  const repoPath = resolve(repoRoot)
+  const files = AGENT_OS_RUNTIME_FILES.map((relPath) => {
+    const content = readTextFn(join(repoPath, relPath))
+    return {
+      path: relPath,
+      sha256: sha256Text(content),
+      bytes: Buffer.byteLength(content, "utf8"),
+    }
+  })
+  const promptPayload = renderPromptFn(repoPath)
+  const prompt = String(promptPayload?.prompt || "")
+  const ruleVersion = (prompt.match(AGENT_OS_RULE_VERSION_RE) || [null, null])[1]
+  const semanticVisibility = Object.fromEntries(
+    AGENT_OS_SEMANTIC_TERMS.map((term) => [term, prompt.includes(term)])
+  )
+  const managedBlock = {
+    begin: String(promptPayload?.managed_begin || ""),
+    end: String(promptPayload?.managed_end || ""),
+  }
+  const writerVisible = prompt.includes(AGENT_OS_WRITER_TERM)
+  const managedBlockVisible = files
+    .find((entry) => entry.path === "agent/agent_os_install.py")
+    ? (() => {
+        const source = readTextFn(join(repoPath, "agent/agent_os_install.py"))
+        return source.includes(managedBlock.begin) && source.includes(managedBlock.end)
+      })()
+    : false
+  const nativePromptBytes = Buffer.byteLength(prompt, "utf8")
+
+  return {
+    files,
+    source_identity_sha256: sha256Text(
+      JSON.stringify({
+        files,
+        ruleVersion,
+        prompt,
+      })
+    ),
+    agent_os_rule_version: ruleVersion,
+    agent_os_native_prompt_sha256: sha256Text(prompt),
+    agent_os_native_prompt_bytes: nativePromptBytes,
+    agent_os_native_prompt_max_bytes: AGENT_OS_NATIVE_PROMPT_MAX_BYTES,
+    agent_os_semantic_terms: AGENT_OS_SEMANTIC_TERMS,
+    agent_os_semantic_visibility: semanticVisibility,
+    agent_os_writer_term: AGENT_OS_WRITER_TERM,
+    agent_os_writer_visible: writerVisible,
+    agent_os_managed_block: managedBlock,
+    agent_os_managed_block_visible: managedBlockVisible,
+    agent_os_prompt_bloat_ok: nativePromptBytes <= AGENT_OS_NATIVE_PROMPT_MAX_BYTES,
+  }
+}
 
 function tryExec(cmd, opts) {
   try {
@@ -155,7 +294,8 @@ function main() {
     branch: stamp.branch,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
-    source: stamp.source
+    source: stamp.source,
+    runtimeBinding: buildAgentOsRuntimeBinding(),
   }
 
   mkdirSync(OUT_DIR, { recursive: true })
