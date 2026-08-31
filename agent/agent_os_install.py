@@ -72,6 +72,43 @@ def load_rule_text(repo_root: Path | str) -> str:
     return (repo_root / "AGENT_OS_CORE.md").read_text(encoding="utf-8").strip() + "\n"
 
 
+def render_hermes_native_prompt(repo_root: Path | str) -> str:
+    from agent.continuous_completion import (
+        REQUIRED_NODE_FIELDS,
+        REQUIRED_OUTPUTS,
+        REQUIRED_STATES,
+    )
+
+    rule_text = load_rule_text(repo_root)
+    version = rule_version(rule_text) or "<missing>"
+    scope = _intro_paragraph(rule_text)
+    laws = _section_items(rule_text, "Core Laws")
+    runtime_rules = _section_items(rule_text, "Runtime Rules")
+
+    lines = [f"AGENT_OS_RULE_VERSION: {version}"]
+    if scope:
+        lines.append(scope)
+    if laws:
+        lines.append(f"Startup flow: {_strip_list_marker(laws[0])}")
+    if len(laws) > 1:
+        lines.append(f"Resume rule: {_strip_list_marker(laws[1])}")
+    if len(laws) > 2:
+        lines.append(f"Writer rule: {_strip_list_marker(laws[2])}")
+    if len(laws) > 3:
+        lines.append(f"Verification rule: {_strip_list_marker(laws[3])}")
+    if len(laws) > 4:
+        lines.append(f"Tiny-task rule: {_strip_list_marker(laws[4])}")
+    lines.append("Future debt inventory fields: " + ", ".join(REQUIRED_NODE_FIELDS))
+    lines.append("States: " + ", ".join(REQUIRED_STATES))
+    lines.append("Outputs: " + ", ".join(REQUIRED_OUTPUTS))
+    if runtime_rules:
+        lines.append(
+            "Runtime rules: "
+            + " ".join(_strip_list_marker(item) for item in runtime_rules)
+        )
+    return "\n".join(line.strip() for line in lines if line and line.strip())
+
+
 def rule_version(rule_text: str) -> str | None:
     match = VERSION_RE.search(rule_text)
     return match.group("value") if match else None
@@ -316,3 +353,39 @@ def _extract_managed_content(content: str) -> str:
         re.DOTALL,
     )
     return match.group("body").strip() if match else ""
+
+
+def _intro_paragraph(rule_text: str) -> str:
+    lines = rule_text.splitlines()
+    body: list[str] = []
+    started = False
+    for line in lines:
+        stripped = line.strip()
+        if not started:
+            if stripped.startswith("AGENT_OS_RULE_VERSION:"):
+                started = True
+            continue
+        if stripped.startswith("## "):
+            break
+        if stripped:
+            body.append(stripped)
+    return " ".join(body)
+
+
+def _section_items(rule_text: str, heading: str) -> list[str]:
+    capture = False
+    items: list[str] = []
+    for line in rule_text.splitlines():
+        stripped = line.strip()
+        if stripped == f"## {heading}":
+            capture = True
+            continue
+        if capture and stripped.startswith("## "):
+            break
+        if capture and stripped:
+            items.append(stripped)
+    return items
+
+
+def _strip_list_marker(value: str) -> str:
+    return re.sub(r"^(\d+\.\s+|-\s+)", "", value.strip())

@@ -2337,6 +2337,45 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     return ""
 
 
+def _load_agent_os_core(cwd_path: Path, context_length: Optional[int] = None) -> str:
+    """AGENT_OS_CORE.md — compact repo-root semantics, loaded additively.
+
+    Unlike the mutually exclusive project-context family (.hermes.md,
+    AGENTS.md, CLAUDE.md, .cursorrules), Agent OS is a repo-root execution
+    contract for implementation/rollout tasks. When present at the git root,
+    inject a compact runtime summary alongside the active project context so
+    fresh Hermes sessions see the same deterministic rules that the external
+    installer writes into other agents.
+    """
+    repo_root = _find_git_root(cwd_path)
+    if repo_root is None:
+        return ""
+    core_path = repo_root / "AGENT_OS_CORE.md"
+    if not core_path.exists():
+        return ""
+    try:
+        from agent.agent_os_install import render_hermes_native_prompt
+
+        content = render_hermes_native_prompt(repo_root)
+        if not content:
+            return ""
+        try:
+            label = str(core_path.relative_to(cwd_path))
+        except ValueError:
+            label = core_path.name
+        scanned = _scan_context_content(content, label)
+        result = f"## {label}\n\n{scanned}"
+        return _truncate_content(
+            result,
+            label,
+            context_length=context_length,
+            read_path=str(core_path),
+        )
+    except Exception as e:
+        logger.debug("Could not read %s: %s", core_path, e)
+        return ""
+
+
 def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
@@ -2384,6 +2423,10 @@ def build_context_files_prompt(
       2. AGENTS.md / agents.md   (merged chain: git root → cwd)
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
+
+    Additive repo-root context:
+      * AGENT_OS_CORE.md at the git root, rendered through the deterministic
+        Agent OS installer/runtime primitives as a compact summary.
 
     SOUL.md from HERMES_HOME is independent and always included when present.
 
@@ -2436,6 +2479,9 @@ def build_context_files_prompt(
         )
     if project_context:
         sections.append(project_context)
+    agent_os_context = _load_agent_os_core(cwd_path, context_length)
+    if agent_os_context:
+        sections.append(agent_os_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
