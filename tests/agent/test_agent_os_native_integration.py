@@ -55,9 +55,13 @@ def test_new_session_prompt_exposes_agent_os_semantics(monkeypatch, tmp_path):
 
     assert "AGENT_OS_RULE_VERSION:" in prompt
     assert "GOAL -> CAPABILITY_ID -> PRIOR_WORK_LOCATE" in prompt
+    assert "PRIOR_WORK_FIRST" in prompt
     assert "READY_FRONTIER" in prompt
     assert "CRITICAL_PATH" in prompt
     assert "PARALLEL_SAFE_FRONTIER" in prompt
+    assert "CAPABILITY_DAG" in prompt
+    assert "ONE_PRIMARY_WRITER" in prompt
+    assert "DURABLE_RESUME" in prompt
     assert "BROKER_UNKNOWN" in prompt
     assert "SignalOps" in prompt
     assert "AGENT_OS_MANAGED_BLOCK_BEGIN" not in prompt
@@ -100,6 +104,7 @@ def test_resumed_session_reuses_agent_os_prompt_without_duplicate_block(
         assert resumed_agent._cached_system_prompt == stored_prompt
         assert resumed_agent._cached_system_prompt.count("AGENT_OS_RULE_VERSION:") == 1
         assert resumed_agent._cached_system_prompt.count("READY_FRONTIER") == 1
+        assert resumed_agent._cached_system_prompt.count("ONE_PRIMARY_WRITER") == 1
         assert resumed_agent._cached_system_prompt.count(
             "Writer rule: Keep one canonical writer."
         ) == 1
@@ -143,3 +148,4 @@ def test_repeated_build_does_not_duplicate_agent_os_section(monkeypatch, tmp_pat
 
     assert first == second
     assert second.count("AGENT_OS_RULE_VERSION:") == 1
+    assert second.count("ONE_PRIMARY_WRITER") == 1

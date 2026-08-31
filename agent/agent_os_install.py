@@ -98,6 +98,22 @@ def render_hermes_native_prompt(repo_root: Path | str) -> str:
         lines.append(f"Verification rule: {_strip_list_marker(laws[3])}")
     if len(laws) > 4:
         lines.append(f"Tiny-task rule: {_strip_list_marker(laws[4])}")
+    lines.append(
+        "PRIOR_WORK_FIRST: reuse accepted work by default; resume from "
+        "FIRST_UNPROVEN_BOUNDARY unless an explicit invalidator fires."
+    )
+    lines.append(
+        "DURABLE_RESUME: GOAL -> CAPABILITY_ID -> PRIOR_WORK_LOCATE -> "
+        "ACCEPTED_BASELINE -> FIRST_UNPROVEN_BOUNDARY -> INVALIDATOR_CHECK."
+    )
+    lines.append(
+        "ONE_PRIMARY_WRITER: keep one canonical writer; read-only scouts "
+        "gather evidence without becoming a second writer."
+    )
+    lines.append(
+        "CAPABILITY_DAG: future debt inventories are dependency DAGs over "
+        "CAPABILITY_ID and DEPS."
+    )
     lines.append("Future debt inventory fields: " + ", ".join(REQUIRED_NODE_FIELDS))
     lines.append("States: " + ", ".join(REQUIRED_STATES))
     lines.append("Outputs: " + ", ".join(REQUIRED_OUTPUTS))
